@@ -1,0 +1,8 @@
+# per-build scratch written by pipelines/ci/*.sh — never committed
+.ci/
+.work/
+.terraform/
+*.tfstate
+*.tfstate.backup
+tfplan
+tfplan.json

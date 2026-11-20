@@ -1,0 +1,209 @@
+// ════════════════════════════════════════════════════════════════════════
+//  pipeline-platform  (L3 · KMS, secrets, IAM, S3, data tier, EKS control plane + nodes · includes the ops stacks backup / alarms)
+//  Layer : L3-platform-data  → infra-modules/L3-platform-data  ·  leaves: infra-live/L3-platform-data/<ENV>/<REGION>/<component>
+//  Order : kms → secrets → ssm-contract → iam-roles → s3 → ecr → private-ca → data tier (parallel) → eks-cluster → eks-irsa → eks-nodes → eks-managed-addons → backup → alarms  (see pipelines/ci/order/platform.order)
+//  Extra : Cluster gate (EKS one-minor-at-a-time + upgrade insights) BEFORE approval — a control-plane upgrade cannot be undone
+//  The canonical 12 stages of the notes (§2.12). PR build = stages 1-9, never an apply · merge to main = 1-12 against dev · promotion = same file, other ENV.
+//  Every stage is one script in pipelines/ci/ — runnable on a laptop; this file only decides WHEN each one runs.
+// ════════════════════════════════════════════════════════════════════════
+pipeline {
+  agent { label 'terraform' }     // ONE node for the whole run: plans stay on its disk between Plan and Apply (never a bare apply)
+  parameters {
+    choice(name: 'ENV',    choices: ['dev', 'qa', 'stage', 'prod', '_shared'], description: 'which environment folder (infra-live/L3-platform-data/<ENV>/…) — _shared = kms / ecr / private-ca — apply it BEFORE the environments')
+    choice(name: 'REGION', choices: ['eu-west-1'], description: 'region folder (state key + provider region)')
+    string(name: 'COMPONENT', defaultValue: 'all', description: "one stack folder (or a,b,c), or 'all' = detect from git diff")
+    choice(name: 'ACTION', choices: ['plan', 'apply'], description: 'plan = stages 1-9 only; apply = through 12')
+    booleanParam(name: 'AUTO_APPROVE', defaultValue: false, description: 'skip the approval gate — honoured for stage / stage-dr ONLY; prod and _shared always need an approver')
+    booleanParam(name: 'ALL_STACKS', defaultValue: false, description: 'ignore the git diff: every leaf in scope (first deploy, re-run after an outage)')
+  }
+  options {
+    skipDefaultCheckout(true)       // the Checkout stage does a full-history checkout itself
+    timestamps()
+    disableConcurrentBuilds()
+    timeout(time: 90, unit: 'MINUTES')
+    buildDiscarder(logRotator(numToKeepStr: '60'))
+  }
+  environment {
+    ORG               = 'acme'
+    LAYER             = 'L3-platform-data'
+    // credentials are bound by ID. A missing ID fails the build at the very start (fail fast), and Jenkins masks the values in the log.
+    ACCOUNT_MAP_FILE  = credentials('iac-account-map')       // secret FILE: lines  DEV_ACCOUNT=<12 digits> …  (aliases → real ids; never in git)
+    TF_SECRETS_FILE   = credentials('iac-tf-secrets')        // secret FILE: TF_VAR_external_id=…  (the sts:ExternalId of terraform-exec)
+    OIDC_TOKEN        = credentials('jenkins-oidc-aws')      // OpenID-Connect id-token minted for THIS build → exchanged for AWS credentials
+    MODULES_REPO_TOKEN = credentials('modules-repo-token')   // read token for the infra-modules git repo (terraform init fetches tagged modules)
+    CHAT_WEBHOOK_URL  = credentials('chat-webhook')          // Google Chat / Slack incoming webhook
+    INFRACOST_API_KEY = credentials('infracost-api-key')
+    PREFLIGHT_TOOLS   = 'tflint trivy conftest infracost'                          // checked by ci/checkout.sh: fail in seconds, not after 40 minutes
+  }
+
+  stages {
+    stage('Checkout') {
+      // full history so `git diff` works; then turn parameters into the TARGET_* values every script reads.
+      // PR build → never apply, any environment · merge to main (triggered by SCM, not by a person) → apply to dev automatically.
+      steps {
+        checkout([$class: 'GitSCM', branches: scm.branches, userRemoteConfigs: scm.userRemoteConfigs,
+                  extensions: [[$class: 'CloneOption', noTags: false, shallow: false]]])
+        script {
+          if (!(params.COMPONENT ==~ /^[a-z0-9_,-]+$/)) { error("COMPONENT '${params.COMPONENT}' is not a valid stack folder list") }
+          def byUser = currentBuild.getBuildCauses('hudson.model.Cause$UserIdCause')
+          env.STARTED_BY    = byUser ? byUser[0].userId : 'scm'
+          env.TARGET_ENV    = env.CHANGE_ID ? 'any' : (params.ENV ?: 'dev')
+          env.TARGET_REGION = env.CHANGE_ID ? 'any' : (params.REGION ?: 'eu-west-1')
+          env.TARGET_ACTION = env.CHANGE_ID ? 'plan' : (params.ACTION ?: 'plan')
+          env.ALL_STACKS    = "${params.ALL_STACKS ?: false}"
+          if (!env.CHANGE_ID && env.BRANCH_NAME == 'main' && !byUser) { env.TARGET_ENV = 'dev'; env.TARGET_ACTION = 'apply' }
+          currentBuild.displayName = "#${env.BUILD_NUMBER} ${env.TARGET_ENV}/${env.LAYER} ${env.TARGET_ACTION}"
+        }
+        sh 'pipelines/ci/checkout.sh'
+      }
+    }
+    stage('Detect changed stacks') {
+      // git diff → changed leaf folders of this layer (module changed → its floating consumers); nothing changed → green, rest skipped
+      steps {
+        sh 'pipelines/ci/detect_changed_stacks.sh L3-platform-data'
+        script { env.HAS_STACKS = hasStacks() ? 'true' : 'false'; if (env.HAS_STACKS == 'false') { currentBuild.description = 'nothing to do' } }
+      }
+    }
+    // stage('Format & lint') {
+    //   when { expression { env.HAS_STACKS == 'true' } }
+    //   // terraform fmt -check · tflint · cfn-lint · no real account ids in git · every component is in an order file
+    //   steps { sh 'pipelines/ci/lint.sh' }
+    // }
+    stage('Validate') {
+      when { expression { env.HAS_STACKS == 'true' } }
+      // init -backend=false + validate, in parallel, NO cloud credentials
+      steps { sh 'pipelines/ci/validate.sh' }
+    }
+    stage('Security scan') {
+      when { expression { env.HAS_STACKS == 'true' } }
+      // trivy config on the source — HIGH/CRITICAL fail, lower severities warn
+      steps { sh 'pipelines/ci/scan.sh' }
+    }
+    // stage('Cost estimate') {
+    //   when { expression { env.HAS_STACKS == 'true' } }
+    //   // Infracost diff vs the base — fails only above COST_FAIL_USD_PER_MONTH
+    //   steps { sh 'pipelines/ci/cost_gate.sh' }
+    //   post { always { archiveArtifacts artifacts: '.ci/cost.txt', allowEmptyArchive: true } }
+    // }
+    stage('Authenticate') {
+      when { expression { env.HAS_STACKS == 'true' } }
+      // OIDC → ci-bootstrap (TOOLING); the AWS provider in each leaf then assumes terraform-exec in its own account
+      steps { sh 'pipelines/ci/assume_role.sh' }
+    }
+    stage('Plan (fan-out within layer)') {
+      when { expression { env.HAS_STACKS == 'true' } }
+      // plan every changed leaf in parallel (capped); saved plan + redacted plan.txt per leaf
+      steps { sh 'pipelines/ci/plan_all.sh' }
+      post { always { archiveArtifacts artifacts: '.ci/plan_summary.txt, .work/**/plan.txt', allowEmptyArchive: true } }
+    }
+    stage('Policy gate') {
+      when { expression { env.HAS_STACKS == 'true' } }
+      // OPA/Conftest on tfplan.json: no 0.0.0.0/0:22, encryption, tags, no public S3, no IAM *:*, no prod deletes
+      steps { sh 'pipelines/ci/policy_gate.sh' }
+      post { always { archiveArtifacts artifacts: '.ci/policy.txt', allowEmptyArchive: true } }
+    }
+    stage('Cluster gate') {
+      when { expression { env.HAS_STACKS == 'true' } }
+      // EKS: one minor version at a time, no downgrade, upgrade-readiness insights — BEFORE approval, because a control-plane upgrade is one-way
+      steps { sh 'pipelines/ci/eks_upgrade_check.sh' }
+    }
+    stage('Approval') {
+      when { expression { env.HAS_STACKS == 'true' && env.TARGET_ACTION == 'apply' && !env.CHANGE_ID && needsApproval() } }
+      // dev and qa: no gate · stage / stage-dr: gate unless AUTO_APPROVE · prod and _shared: ALWAYS a named approver + change ticket (four-eyes)
+      steps {
+        script {
+          timeout(time: 4, unit: 'HOURS') {
+            def r = input(message: "Apply ${env.LAYER} to ${env.TARGET_ENV}/${env.TARGET_REGION}?  Plan: ${env.BUILD_URL}artifact/.ci/plan_summary.txt",
+                          ok: 'Approve apply',
+                          submitter: (env.TARGET_ENV in ['prod', '_shared']) ? 'prod-approvers' : 'platform-approvers',
+                          submitterParameter: 'APPROVER',
+                          parameters: [string(name: 'CHANGE_TICKET', defaultValue: '', description: 'change request, e.g. CHG-12345 (mandatory for stage/prod)')])
+            env.APPROVER = r['APPROVER']; env.CHANGE_TICKET = r['CHANGE_TICKET']
+          }
+        }
+        sh 'pipelines/ci/approval.sh'
+      }
+    }
+    stage('Apply saved plan (ordered)') {
+      when { expression { env.HAS_STACKS == 'true' && env.TARGET_ACTION == 'apply' && !env.CHANGE_ID } }
+      // terraform apply tfplan — NEVER a bare apply; ranks from ci/order/platform.order, groups in parallel, stop at the first failure (no auto-rollback)
+      steps { sh 'pipelines/ci/apply_saved_plans.sh platform' }
+    }
+    stage('Verify & publish') {
+      when { expression { env.HAS_STACKS == 'true' && env.TARGET_ACTION == 'apply' && !env.CHANGE_ID } }
+      // converged? · SSM contract keys exist · smoke test · last_apply marker + deployed/<layer>/<env> tag
+      steps { sh 'pipelines/ci/verify_and_publish.sh platform' }
+    }
+  }
+  post {
+    success { script { notify('SUCCESS', "${env.TARGET_ENV}/${env.LAYER} ${env.TARGET_ACTION} OK — nothing-to-do=${env.HAS_STACKS == 'false'} approver=${env.APPROVER ?: 'n/a'} ticket=${env.CHANGE_TICKET ?: 'n/a'} commit=${(env.GIT_COMMIT ?: '').take(8)}") } }
+    failure { script { notify('FAILURE', "${env.TARGET_ENV}/${env.LAYER} ${env.TARGET_ACTION} FAILED at '${env.STAGE_NAME}' — no auto-rollback; a human decides (fix forward or git revert + re-apply)") } }
+    aborted { script { notify('ABORTED', "${env.TARGET_ENV}/${env.LAYER} ${env.TARGET_ACTION} aborted (approval timeout / manual)") } }
+    unstable { script { notify('WARN', "${env.TARGET_ENV}/${env.LAYER} finished UNSTABLE") } }
+    cleanup { sh 'pipelines/ci/cleanup.sh || true' }    // always: remove the AWS session, tokens and saved plans from the workspace
+  }
+}
+
+// ── helpers: script-level methods, callable from any stage ──────────────────────────────────────────────────────────────
+def hasStacks() {                       // did Detect find anything to do?
+  return fileExists('.ci/changed_stacks.txt') && readFile('.ci/changed_stacks.txt').trim() != ''
+}
+def notify(String status, String msg) { // the text goes through an env var, never into the shell command line (no injection from a parameter)
+  withEnv(["NOTIFY_MSG=${msg}"]) { sh "pipelines/ci/notify.sh ${status} \"\$NOTIFY_MSG\"" }
+}
+def needsApproval() {
+  if (env.TARGET_ACTION != 'apply') { return false }
+  if (env.TARGET_ENV in ['prod', '_shared']) { return true }                  // never skippable
+  if (env.TARGET_ENV in ['stage', 'stage-dr']) { return !params.AUTO_APPROVE }
+  return false                                                              // dev, qa
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// EXPLAINED — how to read this Jenkinsfile (notes: §2.11 explosion math · §2.12 the 12 stages · §2.13 Jenkins)
+//
+// ── Declarative-pipeline syntax, block by block ──
+//   pipeline { … }            the root. Declarative = a fixed, validated shape (agent / parameters / options / environment / stages / post) —
+//                             easier to read and lint than scripted Groovy; `script { … }` is the escape hatch for real Groovy logic.
+//   agent { label 'terraform' }   run on a node carrying that label (terraform, aws, jq, conftest … preinstalled — ci/checkout.sh verifies them).
+//                             ONE agent for the whole pipeline: the saved plans live on its disk from Plan until Apply.
+//   parameters { choice / string / booleanParam }   the build form. Same names in every layer pipeline: ENV · REGION · COMPONENT · ACTION · AUTO_APPROVE.
+//                             They arrive in scripts as env vars; the Checkout stage normalises them into TARGET_ENV / TARGET_REGION / TARGET_ACTION.
+//   options { … }             skipDefaultCheckout (we check out with full history) · timestamps · disableConcurrentBuilds (one run per job at a time;
+//                             the S3 state lock is the second line of defence) · timeout 90 min · keep the last 60 builds.
+//   environment { X = credentials('id') }   binds a Jenkins credential to an env var for every stage. Secret text → its value; secret FILE → a path to a
+//                             temp file. Values are masked in the console. The real AWS account ids and the ExternalId live ONLY there.
+//   stages { stage('x') { when { expression { … } } steps { sh '…' } post { always { … } } } }
+//                             `when` decides if the stage runs (HAS_STACKS false → skipped, so a no-op build is green and quick);
+//                             `steps` is the work — always ONE script call, so the logic is testable outside Jenkins;
+//                             a stage-level `post { always { archiveArtifacts … } }` keeps the evidence even when the stage failed.
+//   input(…, submitter, submitterParameter)   pauses the build for a human. `submitter` = who may click; `submitterParameter` = Jenkins returns WHO clicked
+//                             (APPROVER), so the audit record holds a real user id. Wrapped in timeout() so an unanswered gate ends in ABORTED.
+//   post { success / failure / aborted / unstable / cleanup }   runs after the stages. cleanup always runs last — it deletes credentials and saved plans.
+//   def hasStacks() / notify() …   methods outside the pipeline block are ordinary Groovy; notify() passes the message through an env var so a
+//                             parameter value can never be interpreted by the shell.
+//   env.CHANGE_ID             set only on pull-request builds (multibranch) → the pipeline forces ACTION=plan: a PR can NEVER apply.
+//
+// ── Stage ↔ script ↔ notes ──
+//     1 Checkout .............. checkout.sh .............. full history, tool preflight
+//     2 Detect changed stacks . detect_changed_stacks.sh ... git diff → leaves, module → floating consumers, ordered by ci/order
+//     3 Format & lint ......... lint.sh ................. fmt · tflint · cfn-lint · no account ids in git        (hard fail)
+//     4 Validate .............. validate.sh .............. init -backend=false + validate, no credentials         (hard fail)
+//     5 Security scan ......... scan.sh .................. trivy config, HIGH+CRITICAL fail                      (fail HIGH+)
+//     6 Cost estimate ......... cost_gate.sh ............. Infracost diff, fails over a threshold               (threshold)
+//     7 Authenticate .......... assume_role.sh ........... OIDC → ci-bootstrap → (provider) terraform-exec        (no static keys)
+//     8 Plan .................. plan_all.sh .............. plan -out=tfplan, parallel, summary, REPLACE warnings
+//     9 Policy gate ........... policy_gate.sh ........... Conftest on tfplan.json                                (hard fail)
+//    10 Approval .............. input() + approval.sh .... named approver, ticket, four-eyes                       (abort)
+//    11 Apply saved plan ...... apply_saved_plans.sh .... exactly the reviewed plan, in dependency order        (page a human)
+//    12 Verify & publish ...... verify_and_publish.sh ... converged? contract keys? smoke? marker + tag             (warn)
+//
+// ── Required Jenkins plugins / setup ──
+//   Pipeline (declarative), Git, Credentials Binding, Timestamps, OpenID Connect Provider (the `jenkins-oidc-aws` token; its issuer + sub claim must match
+//   what the ci-oidc-roles leaf trusts: ci_issuer_url / ci_subject), a multibranch job on this repo (so CHANGE_ID / BRANCH_NAME exist), and an
+//   agent image with: terraform, jq, aws-cli v2, git, tflint, trivy, conftest, infracost (+ helm & kubectl for addons, cfn-lint for global).
+//
+// ── Platform specifics ──
+//   Cluster gate              runs before approval: the approver sees a plan that is already known to be upgrade-safe. Only the eks-cluster leaf is checked.
+//   _shared first             ENV=_shared carries kms / ecr / private-ca: apply it once before the first environment (ecr reads the shared kms key).
+//   ops stacks                backup and observability-alarms (module layer Lops) live in this layer's leaves and are the last two in platform.order.
+// ════════════════════════════════════════════════════════════════════════

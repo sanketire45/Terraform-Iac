@@ -1,0 +1,7 @@
+{
+  "exceptions": {
+    "open_ssh": [],
+    "prod_delete": [],
+    "unencrypted": []
+  }
+}

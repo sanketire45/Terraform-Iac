@@ -1,0 +1,16 @@
+# apply order inside pipeline-platform (L3 + ops)  (destroy = reverse). Format: `a | b` = same group (parallel ok); # = comment.
+# ENV=_shared carries kms, ecr, private-ca — apply it BEFORE any environment.
+kms
+secrets
+ssm-contract
+iam-roles
+s3
+ecr
+private-ca
+rds-aurora | dynamodb | msk | efs | messaging-sqs-sns | aurora-global   # data tier: independent of each other
+eks-cluster
+eks-irsa             # needs the cluster's OIDC issuer — NEVER before eks-cluster
+eks-nodes
+eks-managed-addons
+backup               # ops
+observability-alarms # ops

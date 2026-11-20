@@ -1,0 +1,5 @@
+{"format_version":"1.2","resource_changes":[
+ {"address":"module.rds.aws_rds_cluster.main","type":"aws_rds_cluster","name":"main","change":{"actions":["delete","create"],"before":{"tags_all":{"Environment":"prod"}},"after":{"storage_encrypted":true,"tags_all":{"Environment":"prod","Application":"a","Owner":"o","CostCenter":"c","DataClassification":"d","ManagedBy":"terraform"}}}},
+ {"address":"module.rds.aws_db_instance.old","type":"aws_db_instance","name":"old","change":{"actions":["delete"],"before":{"tags_all":{"Environment":"prod"}},"after":null}},
+ {"address":"module.dev.aws_db_instance.scratch","type":"aws_db_instance","name":"scratch","change":{"actions":["delete"],"before":{"tags_all":{"Environment":"dev"}},"after":null}}
+],"configuration":{"root_module":{}}}

@@ -1,0 +1,10 @@
+# Reviewed exceptions for `trivy config` (pipelines/ci/scan.sh). Every entry needs: the misconfiguration id, a WRITTEN reason,
+# an owner and an expiry — an exception without an end date is a permanent hole. Changes here are reviewed through CODEOWNERS.
+#
+# Example (kept commented on purpose):
+# misconfigurations:
+#   - id: AVD-AWS-0000
+#     paths: ["infra-modules/L3-platform-data/s3/main.tf"]
+#     statement: "why this is acceptable here, and the ticket that tracks the fix"
+#     expired_at: 2027-03-31
+misconfigurations: []
