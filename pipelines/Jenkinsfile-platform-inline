@@ -1,5 +1,5 @@
 pipeline {
-  agent { label 'terraform' }
+  agent any
 
   parameters {
     choice(
@@ -339,6 +339,7 @@ pipeline {
               load_aws "$stack"
               (
                 set +e; cd "$wd" || exit 0
+                render_aliases "$wd" real
                 terraform init "${TF_INIT_ARGS[@]}"                || { echo 1 > plan.rc; exit 0; }
                 render_aliases "$wd" real
                 terraform plan -input=false -no-color -lock-timeout=5m -detailed-exitcode -out=tfplan

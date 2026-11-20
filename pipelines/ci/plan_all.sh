@@ -21,6 +21,7 @@ if [ "${1:-}" = "--one" ]; then                       # ───── worker: 
   load_aws "$stack"                                       # the session of THIS stack's environment (written by assume_role.sh)
   (
     set +e; cd "$wd" || exit 0
+    render_aliases "$wd" real                           # BEFORE init: the backend bucket name contains TOOLING_ACCOUNT
     terraform init "${TF_INIT_ARGS[@]}"                || { echo 1 > plan.rc; exit 0; }
     render_aliases "$wd" real                           # AFTER init, so modules downloaded from a tag are rendered as well
     terraform plan -input=false -no-color -lock-timeout=5m -detailed-exitcode -out=tfplan
