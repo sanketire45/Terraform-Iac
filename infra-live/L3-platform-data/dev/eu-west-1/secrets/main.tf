@@ -15,17 +15,8 @@ terraform {
   }
 }
 
-variable "external_id" {
-  type      = string
-  sensitive = true # sts:ExternalId the terraform-exec trust policy demands — injected by the pipeline as TF_VAR_external_id, never in git
-}
-
 provider "aws" {
   region = "eu-west-1"
-  assume_role {
-    role_arn    = "arn:aws:iam::DEV_ACCOUNT:role/terraform-exec"
-    external_id = var.external_id
-  }
   default_tags {
     tags = {
       Environment        = "dev"
@@ -74,10 +65,8 @@ module "secrets" {
 #
 # ── provider "aws" ──
 #   region       where this leaf creates things (the state bucket region above is independent of it).
-#   assume_role  the trust chain with NO long-lived keys: CI OIDC token → ci-bootstrap (TOOLING) → terraform-exec in DEV_ACCOUNT.
-#                Each target account only trusts ci-bootstrap (+ ExternalId), so a leaf can only ever touch its own account.
-#   external_id  the shared secret the terraform-exec trust policy demands (sts:ExternalId). A sensitive variable: the pipeline injects
-#                TF_VAR_external_id from its secret store, so it is never in git. (Every aliased provider in a leaf carries it too.)
+#   (no assume_role)  Whirlpool style: this provider uses the AWS session that pipelines/ci/assume_role.sh exported for this environment
+#                (account + role come from pipelines/config/<scope>-config.txt), so there is nothing to assume here.
 #   default_tags every resource created by this leaf gets the mandatory tags — Environment / ManagedBy / Layer / Owner / Application /
 #                CostCenter / DataClassification / Repo (policy/require_tags.rego fails the plan if one is missing) — cost allocation,
 #                drift triage and the "who do I page" question are answered by tags alone.

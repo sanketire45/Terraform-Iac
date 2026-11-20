@@ -13,6 +13,7 @@ need terraform
 if [ "${1:-}" = "--one" ]; then                       # ───── worker: apply ONE saved plan ─────
   stack="$2"; id="$(stack_id "$stack")"; wd="$WORK/$id"
   [ -f "$wd/tfplan" ] || die "no saved plan for $stack — plan_all.sh must run first (a bare apply is forbidden)"
+  load_aws "$stack"                                       # the session of THIS stack's environment
   cd "$wd"
   terraform apply -input=false -no-color -lock-timeout=5m tfplan 2>&1 | sed "s|^|[$id] |"
   exit 0
@@ -22,7 +23,7 @@ order="${1:?usage: apply_saved_plans.sh <order-name>}"
 [ -f "$CI_DIR/order/$order.order" ] || die "no such order file: ci/order/$order.order"
 [ -s "$APPLY_FILE" ] || { log "no stack has changes — nothing to apply"; exit 0; }
 [ "$TARGET_ACTION" = apply ] || die "refusing to apply: ACTION is '$TARGET_ACTION'"
-load_aws; load_tf_secrets; git_auth
+load_tf_secrets; git_auth
 
 # the leaves of THIS order file that have changes, as "rank<TAB>stack", lowest rank first
 queue="$STATE_DIR/apply_queue_$order.txt"; : > "$queue"

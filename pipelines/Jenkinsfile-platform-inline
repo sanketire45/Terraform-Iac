@@ -1,0 +1,822 @@
+pipeline {
+  agent { label 'terraform' }
+
+  parameters {
+    choice(
+      name: 'ENV',
+      choices: ['dev', 'qa', 'stage', 'prod', '_shared'],
+      description: 'Environment folder under infra-live/L3-platform-data/<ENV>. _shared = kms / ecr / private-ca, apply it BEFORE the environments.'
+    )
+    choice(
+      name: 'REGION',
+      choices: ['eu-west-1'],
+      description: 'Region folder (state key + provider region).'
+    )
+    string(
+      name: 'COMPONENT',
+      defaultValue: 'all',
+      description: "One stack folder (or a,b,c), or 'all' = detect from the git diff."
+    )
+    choice(
+      name: 'ACTION',
+      choices: ['plan', 'apply'],
+      description: 'plan = plan only; apply = plan, approval, apply, verify.'
+    )
+    booleanParam(
+      name: 'AUTO_APPROVE',
+      defaultValue: false,
+      description: 'Skip the approval gate. Honoured for stage only; prod and _shared always need an approver.'
+    )
+    booleanParam(
+      name: 'ALL_STACKS',
+      defaultValue: false,
+      description: 'Ignore the git diff: every leaf in scope (first deploy, re-run after an outage).'
+    )
+  }
+
+  options {
+    skipDefaultCheckout(true)
+    timestamps()
+    disableConcurrentBuilds()
+    timeout(time: 90, unit: 'MINUTES')
+    buildDiscarder(logRotator(numToKeepStr: '60'))
+  }
+
+  environment {
+    ORG                = 'acme'
+    LAYER              = 'L3-platform-data'
+    IAC_DIR            = '.'
+    LOCAL_MODULES_ALL  = 'true'
+    PREFLIGHT_TOOLS    = ''
+    AWS_ACCOUNT_ID     = ''
+    JENKINS_ROLE_ARN   = ''
+    AWS_REGION         = ''
+    SHARED_ACCOUNT_ID  = ''
+  }
+
+  stages {
+
+    stage('Checkout') {
+      steps {
+        checkout([
+          $class: 'GitSCM',
+          branches: scm.branches,
+          userRemoteConfigs: scm.userRemoteConfigs,
+          extensions: [[$class: 'CloneOption', noTags: false, shallow: false]]
+        ])
+        script {
+          if (!(params.COMPONENT ==~ /^[a-z0-9_,-]+$/)) {
+            error("COMPONENT '${params.COMPONENT}' is not a valid stack folder list")
+          }
+
+          def byUser = currentBuild.getBuildCauses('hudson.model.Cause$UserIdCause')
+
+          env.STARTED_BY    = byUser ? byUser[0].userId : 'scm'
+          env.TARGET_ENV    = env.CHANGE_ID ? 'any'  : (params.ENV ?: 'dev')
+          env.TARGET_REGION = env.CHANGE_ID ? 'any'  : (params.REGION ?: 'eu-west-1')
+          env.TARGET_ACTION = env.CHANGE_ID ? 'plan' : (params.ACTION ?: 'plan')
+          env.ALL_STACKS    = "${params.ALL_STACKS ?: false}"
+
+          if (!env.CHANGE_ID && env.BRANCH_NAME == 'main' && !byUser) {
+            env.TARGET_ENV    = 'dev'
+            env.TARGET_ACTION = 'apply'
+          }
+
+          currentBuild.displayName = "#${env.BUILD_NUMBER} ${env.TARGET_ENV}/${env.LAYER} ${env.TARGET_ACTION}"
+
+          runBash('''\
+            need git terraform jq aws
+            [ -z "${PREFLIGHT_TOOLS:-}" ] || need $PREFLIGHT_TOOLS
+
+            if [ "$(git -C "$ROOT" rev-parse --is-shallow-repository)" = true ]; then
+              log "shallow clone → fetching full history"
+              git -C "$ROOT" fetch --unshallow --tags --quiet
+            fi
+
+            TARGET="${CHANGE_TARGET:-main}"
+            if git -C "$ROOT" remote get-url origin >/dev/null 2>&1; then
+              git -C "$ROOT" fetch origin "$TARGET" --quiet || warn "could not fetch origin/$TARGET — the diff base will fall back to HEAD~1"
+              git -C "$ROOT" fetch origin 'refs/tags/deployed/*:refs/tags/deployed/*' --quiet 2>/dev/null || true
+            else
+              warn "no 'origin' remote — diffing against local history only"
+            fi
+
+            git -C "$ROOT" rev-parse HEAD | tee "$STATE_DIR/git_sha" >/dev/null
+            log "checked out $(cut -c1-12 "$STATE_DIR/git_sha") · terraform $(terraform version -json 2>/dev/null | jq -r .terraform_version 2>/dev/null || echo '?')"
+          '''.stripIndent())
+        }
+      }
+    }
+
+    stage('Load config') {
+      when { expression { env.TARGET_ENV != 'any' } }
+      steps {
+        script {
+          def config_file = "${pfx()}pipelines/config/${env.TARGET_ENV}-config.txt"
+
+          if (!fileExists(config_file)) {
+            error("config file not found: ${config_file}")
+          }
+
+          env.AWS_ACCOUNT_ID    = readConfigParameter("AWS_ACCOUNT_ID", config_file)
+          env.JENKINS_ROLE_ARN  = readConfigParameter("JENKINS_ROLE_ARN", config_file)
+          env.AWS_REGION        = readConfigParameter("AWS_REGION", config_file)
+          env.SHARED_ACCOUNT_ID = readConfigParameter("SHARED_ACCOUNT_ID", config_file)
+
+          for (key in ['AWS_ACCOUNT_ID', 'JENKINS_ROLE_ARN', 'AWS_REGION', 'SHARED_ACCOUNT_ID']) {
+            def value = env."${key}"
+            if (!value || value.startsWith('REPLACE')) {
+              error("${key} is not filled in: ${config_file}")
+            }
+          }
+
+          echo "config ${config_file}: account=${env.AWS_ACCOUNT_ID} role=${env.JENKINS_ROLE_ARN} region=${env.AWS_REGION} state-account=${env.SHARED_ACCOUNT_ID}"
+        }
+      }
+    }
+
+    stage('Detect changed stacks') {
+      steps {
+        script {
+          runBash('''\
+            need git
+            layer="$LAYER"
+            [ -d "$LIVE/$layer" ] || die "no such layer folder: infra-live/$layer"
+            ALL_STACKS="${ALL_STACKS:-false}"
+
+            tmp="$STATE_DIR/detect"; mkdir -p "$tmp"
+            : > "$tmp/all.txt"; : > "$tmp/scope.txt"; : > "$tmp/cand.txt"
+
+            ( cd "$LIVE" && find "$layer" -mindepth 4 -maxdepth 4 -name main.tf | sed 's|/main.tf$||' | sort ) > "$tmp/all.txt"
+
+            while IFS= read -r s; do
+              sc="$(printf '%s' "$s" | cut -d/ -f2)"; rg="$(printf '%s' "$s" | cut -d/ -f3)"
+              [ "$TARGET_ENV" = any ]    || [ "$sc" = "$TARGET_ENV" ]    || continue
+              [ "$TARGET_REGION" = any ] || [ "$rg" = "$TARGET_REGION" ] || continue
+              printf '%s\\n' "$s"
+            done < "$tmp/all.txt" > "$tmp/scope.txt"
+            [ -s "$tmp/scope.txt" ] || log "no leaves exist in $layer for env=$TARGET_ENV region=$TARGET_REGION"
+
+            resolve_base() {
+              if   [ -n "${BASE_SHA:-}" ];  then printf '%s' "$BASE_SHA"
+              elif [ -n "${CHANGE_ID:-}" ]; then git -C "$ROOT" merge-base HEAD "origin/${CHANGE_TARGET:-main}" 2>/dev/null || true
+              elif [ "$TARGET_ENV" != any ] && git -C "$ROOT" rev-parse -q --verify "refs/tags/deployed/$layer/$TARGET_ENV" >/dev/null 2>&1; then
+                   git -C "$ROOT" rev-parse "refs/tags/deployed/$layer/$TARGET_ENV^{commit}"
+              elif [ -n "${GIT_PREVIOUS_SUCCESSFUL_COMMIT:-}" ]; then printf '%s' "$GIT_PREVIOUS_SUCCESSFUL_COMMIT"
+              else git -C "$ROOT" rev-parse -q --verify HEAD~1 2>/dev/null || true
+              fi
+            }
+
+            consumers() {
+              grep -rlF --include=main.tf "infra-modules.git//$1?ref=main" "$LIVE/$layer" 2>/dev/null \\
+                | sed "s|^$LIVE/||; s|/main.tf$||" || true
+            }
+
+            if [ "$COMPONENT" != all ]; then
+              log "explicit COMPONENT=$COMPONENT (the git diff is ignored)"
+              for c in $(printf '%s' "$COMPONENT" | tr ',' ' '); do
+                n0="$(wc -l < "$tmp/cand.txt" | tr -d ' ')"
+                awk -F/ -v c="$c" '$NF == c' "$tmp/scope.txt" >> "$tmp/cand.txt"
+                [ "$(wc -l < "$tmp/cand.txt" | tr -d ' ')" -gt "$n0" ] || die "component '$c' has no leaf in $layer for env=$TARGET_ENV region=$TARGET_REGION"
+              done
+            elif [ "$ALL_STACKS" = true ]; then
+              log "ALL_STACKS=true → every leaf in scope"
+              cp "$tmp/scope.txt" "$tmp/cand.txt"
+            else
+              base="$(resolve_base)"
+              if [ -z "$base" ]; then
+                log "no diff base found (first run?) → treating every leaf in scope as changed"
+                cp "$tmp/scope.txt" "$tmp/cand.txt"
+              else
+                log "diff base: $(printf '%s' "$base" | cut -c1-12)  →  HEAD"
+                git -C "$ROOT" diff --name-only --relative "$base" HEAD -- . > "$tmp/files.txt" || die "git diff failed (is $base in the history?)"
+                while IFS= read -r f; do
+                  case "$f" in
+                    infra-live/"$layer"/*)
+                      printf '%s\\n' "$f" | cut -d/ -f2-5 >> "$tmp/cand.txt" ;;
+                    infra-modules/"$layer"/*/*)
+                      m="$(printf '%s' "$f" | cut -d/ -f2-3)"
+                      consumers "$m" >> "$tmp/cand.txt"
+                      pinned="$( { grep -rlE --include=main.tf "infra-modules\\.git//$m\\?ref=v" "$LIVE/$layer" 2>/dev/null || true; } | wc -l | tr -d ' ')"
+                      [ "$pinned" = 0 ] || log "module $m changed: $pinned leaf(s) pin a release tag and are NOT affected until their ?ref is bumped" ;;
+                    policy/*|pipelines/*)
+                      [ -n "${widened:-}" ] || log "$f changed (policy/pipeline code) → every leaf in scope is re-tested"; widened=1
+                      cat "$tmp/scope.txt" >> "$tmp/cand.txt" ;;
+                  esac
+                done < "$tmp/files.txt"
+              fi
+            fi
+
+            sort -u "$tmp/cand.txt" | grep -Fxf "$tmp/scope.txt" > "$tmp/final.txt" || true
+
+            rank_of() {
+              local i=0 o r
+              for o in $(layer_orders "$layer"); do
+                i=$((i + 1)); r="$(order_of_stack "$o" "$1")"
+                if [ -n "$r" ]; then echo $((i * 1000 + r)); return 0; fi
+              done
+              return 1
+            }
+            : > "$tmp/ranked.txt"
+            while IFS= read -r s; do
+              [ -n "$s" ] || continue
+              r="$(rank_of "$s")" || die "$s is not listed in any ci/order/*.order file ($(layer_orders "$layer")) — add the component, otherwise the pipeline cannot know when to apply it"
+              printf '%s\\t%s\\n' "$r" "$s" >> "$tmp/ranked.txt"
+            done < "$tmp/final.txt"
+            sort -t "$(printf '\\t')" -k1,1n -k2,2 "$tmp/ranked.txt" | cut -f2 > "$CHANGED_FILE"
+
+            n="$(grep -c . "$CHANGED_FILE" || true)"
+            if [ "$n" = 0 ]; then
+              log "No stack changed — exiting green."
+            else
+              log "$n stack(s) to process, in apply order:"
+              sed 's/^/    /' "$CHANGED_FILE" >&2
+            fi
+          '''.stripIndent())
+
+          env.HAS_STACKS = hasStacks() ? 'true' : 'false'
+          if (env.HAS_STACKS == 'false') {
+            currentBuild.description = 'nothing to do'
+          }
+        }
+      }
+    }
+
+    stage('Validate') {
+      when { expression { env.HAS_STACKS == 'true' } }
+      steps {
+        script {
+          runBash('''\
+
+            validate_one() {
+              stack="$1"; id="$(stack_id "$stack")"
+              wd="$(make_workdir "$stack" "$LIVE" "$MODS" "$WORK/validate")"
+              render_aliases "$wd" dummy
+              ( cd "$wd" && terraform init -backend=false "${TF_INIT_ARGS[@]}" >/dev/null && terraform validate -no-color ) 2>&1 | sed "s|^|[$id] |"
+            }
+            export -f validate_one
+
+            [ -s "$CHANGED_FILE" ] || { log "nothing to validate"; exit 0; }
+            git_auth
+            log "validating $(grep -c . "$CHANGED_FILE") stack(s), $PLAN_PARALLEL at a time"
+            set +e
+            grep . "$CHANGED_FILE" | xargs -P "$PLAN_PARALLEL" -I{} bash -c '. .ci/lib.sh; validate_one "$1"' _ {} | tee "$STATE_DIR/validate.log"
+            rc=$?
+            set -e
+            bad="$(grep -c 'Error' "$STATE_DIR/validate.log" || true)"
+            if [ "$rc" != 0 ] || [ "$bad" != 0 ]; then die "validate failed ($bad error line(s)) — see the log above"; fi
+            log "validate OK"
+          '''.stripIndent())
+        }
+      }
+    }
+
+    stage('Authenticate') {
+      when { expression { env.HAS_STACKS == 'true' } }
+      steps {
+        script {
+          runBash('''\
+            [ -s "$CHANGED_FILE" ] || { log "nothing to deploy — no credentials requested"; exit 0; }
+            need aws jq
+
+            me="$(aws sts get-caller-identity --query Arn --output text 2>/dev/null)" \\
+              || die "the Jenkins agent has no AWS identity — give the node an instance role / profile / keys that may call sts:AssumeRole on the role named in JENKINS_ROLE_ARN"
+            log "Jenkins agent identity: $(printf '%s' "$me" | sed -E 's#:[0-9]{12}:#:<account>:#')"
+
+            session="$(printf 'jenkins-%s' "${BUILD_TAG:-manual}" | tr -c 'A-Za-z0-9+=,.@_-' '-' | cut -c1-64)"
+
+            scopes="$(cut -d/ -f2 "$CHANGED_FILE" | sort -u)"
+
+            for scope in $scopes; do
+              cfg="$(config_file "$scope")"
+              if [ "$scope" = "${TARGET_ENV:-}" ] && [ -n "${AWS_ACCOUNT_ID:-}" ]; then
+                account="$AWS_ACCOUNT_ID"; role="$JENKINS_ROLE_ARN"; region="$AWS_REGION"
+              else
+                account="$(read_config AWS_ACCOUNT_ID   "$cfg")"
+                role="$(read_config    JENKINS_ROLE_ARN "$cfg")"
+                region="$(read_config  AWS_REGION       "$cfg")"
+              fi
+              for pair in "AWS_ACCOUNT_ID=$account" "JENKINS_ROLE_ARN=$role" "AWS_REGION=$region"; do
+                case "${pair#*=}" in ''|REPLACE*) die "${pair%%=*} is not filled in: ${cfg#$ROOT/}" ;; esac
+              done
+
+              creds="$(aws sts assume-role \\
+                        --role-arn "arn:aws:iam::$account:role/$role" \\
+                        --role-session-name "$session" \\
+                        --duration-seconds 3600 --output json)" \\
+                || die "cannot assume role/$role in the '$scope' account — does the role's trust policy allow the Jenkins agent identity above?"
+
+              umask 077
+              {
+                printf 'export AWS_ACCESS_KEY_ID=%s\\n'     "$(printf '%s' "$creds" | jq -r .Credentials.AccessKeyId)"
+                printf 'export AWS_SECRET_ACCESS_KEY=%s\\n' "$(printf '%s' "$creds" | jq -r .Credentials.SecretAccessKey)"
+                printf 'export AWS_SESSION_TOKEN=%s\\n'     "$(printf '%s' "$creds" | jq -r .Credentials.SessionToken)"
+                printf 'export AWS_DEFAULT_REGION=%s\\n'    "$region"
+              } > "$STATE_DIR/aws-$scope.env"
+
+              ( . "$STATE_DIR/aws-$scope.env"
+                got="$(aws sts get-caller-identity --query Account --output text)" || exit 1
+                [ "$got" = "$account" ] || { echo "session is in a different account than AWS_ACCOUNT_ID" >&2; exit 1; } ) \\
+                || die "the '$scope' session does not work or is not in AWS_ACCOUNT_ID — check ${cfg#$ROOT/}"
+              log "scope '$scope': assumed role/$role (account from ${cfg#$ROOT/}) → .ci/aws-$scope.env"
+            done
+          '''.stripIndent())
+        }
+      }
+    }
+
+    stage('Plan (fan-out within layer)') {
+      when { expression { env.HAS_STACKS == 'true' } }
+      steps {
+        script {
+          runBash('''\
+
+            plan_one() {
+              stack="$1"; id="$(stack_id "$stack")"
+              mkdir -p "$STATE_DIR/results"
+              wd="$(make_workdir "$stack")"
+              rm -f "$wd/plan.rc"
+              load_aws "$stack"
+              (
+                set +e; cd "$wd" || exit 0
+                terraform init "${TF_INIT_ARGS[@]}"                || { echo 1 > plan.rc; exit 0; }
+                render_aliases "$wd" real
+                terraform plan -input=false -no-color -lock-timeout=5m -detailed-exitcode -out=tfplan
+                echo $? > plan.rc
+              ) 2>&1 | sed "s|^|[$id] |" | tee "$wd/plan.log"
+              rc="$(cat "$wd/plan.rc" 2>/dev/null || echo 1)"
+              add=0; chg=0; del=0; rep=0
+              if [ "$rc" = 0 ] || [ "$rc" = 2 ]; then
+                ( cd "$wd" && terraform show -no-color tfplan > plan.txt && terraform show -json tfplan > tfplan.json )
+                read -r add chg del rep <<EOF
+            $(jq -r '[.resource_changes[]? | select((.change.actions | index("no-op") | not) and (.change.actions | index("read") | not))] as $c
+                     | [ ($c | map(select(.change.actions == ["create"])) | length),
+                         ($c | map(select(.change.actions == ["update"])) | length),
+                         ($c | map(select(.change.actions == ["delete"])) | length),
+                         ($c | map(select((.change.actions | index("delete")) and (.change.actions | index("create")))) | length) ] | @tsv' "$wd/tfplan.json")
+            EOF
+              fi
+              printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' "$stack" "$rc" "$add" "$chg" "$del" "$rep" > "$STATE_DIR/results/$id.tsv"
+              exit 0
+            }
+            export -f plan_one
+
+            [ -s "$CHANGED_FILE" ] || { log "nothing to plan"; exit 0; }
+            git_auth
+            rm -rf "$STATE_DIR/results"; mkdir -p "$STATE_DIR/results"; : > "$APPLY_FILE"; : > "$STATE_DIR/applied_stacks.txt"
+
+            log "planning $(grep -c . "$CHANGED_FILE") stack(s), $PLAN_PARALLEL at a time"
+            grep . "$CHANGED_FILE" | xargs -P "$PLAN_PARALLEL" -I{} bash -c '. .ci/lib.sh; plan_one "$1"' _ {} || true
+
+            sum="$STATE_DIR/plan_summary.txt"
+            { printf '%-62s %-9s %4s %4s %4s %4s\\n' STACK RESULT ADD CHG DEL REPL
+              while IFS= read -r s; do
+                [ -n "$s" ] || continue
+                f="$STATE_DIR/results/$(stack_id "$s").tsv"
+                if [ -f "$f" ]; then IFS="$(printf '\\t')" read -r _ rc a c d r < "$f"; else rc=1; a=-; c=-; d=-; r=-; fi
+                case "$rc" in 0) res="no-change" ;; 2) res="CHANGES" ;; *) res="FAILED" ;; esac
+                printf '%-62s %-9s %4s %4s %4s %4s\\n' "$s" "$res" "$a" "$c" "$d" "$r"
+              done < "$CHANGED_FILE"; } | tee "$sum" >&2
+
+            failed=0; destructive=0
+            while IFS= read -r s; do
+              [ -n "$s" ] || continue
+              f="$STATE_DIR/results/$(stack_id "$s").tsv"
+              [ -f "$f" ] || { failed=1; continue; }
+              IFS="$(printf '\\t')" read -r _ rc a c d r < "$f"
+              case "$rc" in 2) printf '%s\\n' "$s" >> "$APPLY_FILE" ;; 0) ;; *) failed=1 ;; esac
+              if [ "${d:-0}" != 0 ] || [ "${r:-0}" != 0 ]; then
+                destructive=1
+                warn "$s: destroys ${d:-0} and REPLACES ${r:-0} resource(s) — read plan.txt for 'must be replaced' before approving"
+                grep -h 'must be replaced' "$WORK/$(stack_id "$s")/plan.txt" 2>/dev/null | head -10 | sed 's/^/        /' >&2 || true
+              fi
+            done < "$CHANGED_FILE"
+            printf 'destructive=%s\\n' "$destructive" > "$STATE_DIR/plan_flags.env"
+
+            [ "$failed" = 0 ] || die "plan failed for at least one stack — nothing will be applied"
+            log "plan OK — $(grep -c . "$APPLY_FILE" || true) stack(s) have changes to apply"
+          '''.stripIndent())
+        }
+      }
+      post {
+        always {
+          archiveArtifacts(
+            artifacts: "${pfx()}.ci/plan_summary.txt, ${pfx()}.work/**/plan.txt",
+            allowEmptyArchive: true
+          )
+        }
+      }
+    }
+
+    stage('Policy gate') {
+      when { expression { env.HAS_STACKS == 'true' } }
+      steps {
+        echo "hello"
+      }
+    }
+
+    stage('Approval') {
+      when {
+        expression {
+          env.HAS_STACKS == 'true' && env.TARGET_ACTION == 'apply' && !env.CHANGE_ID && needsApproval()
+        }
+      }
+      steps {
+        script {
+          timeout(time: 4, unit: 'HOURS') {
+            def r = input(
+              message: "Apply ${env.LAYER} to ${env.TARGET_ENV}/${env.TARGET_REGION}?  Plan: ${env.BUILD_URL}artifact/${pfx()}.ci/plan_summary.txt",
+              ok: 'Approve apply',
+              submitter: (env.TARGET_ENV in ['prod', '_shared']) ? 'prod-approvers' : 'platform-approvers',
+              submitterParameter: 'APPROVER',
+              parameters: [
+                string(name: 'CHANGE_TICKET', defaultValue: '', description: 'change request, e.g. CHG-12345 (mandatory for stage/prod)')
+              ]
+            )
+            env.APPROVER      = r['APPROVER']
+            env.CHANGE_TICKET = r['CHANGE_TICKET']
+          }
+
+          runBash('''\
+            need jq
+
+            APPROVER="${APPROVER:-}"; STARTED_BY="${STARTED_BY:-}"; CHANGE_TICKET="${CHANGE_TICKET:-}"
+            TICKET_REGEX="${TICKET_REGEX:-^[A-Z][A-Z0-9]+-[0-9]+\\$}"
+
+            [ -n "$APPROVER" ] || die "no approver was recorded — the approval input did not return a submitter"
+
+            case "$TARGET_ENV" in
+              stage|stage-dr|prod|org|tooling|_shared)
+                printf '%s' "$CHANGE_TICKET" | grep -Eq "$TICKET_REGEX" || die "change ticket '$CHANGE_TICKET' does not match $TICKET_REGEX" ;;
+            esac
+
+            case "$TARGET_ENV" in
+              prod|org|tooling)
+                [ -z "$STARTED_BY" ] || [ "$APPROVER" != "$STARTED_BY" ] || die "four-eyes rule: '$APPROVER' started this $TARGET_ENV build and cannot approve it" ;;
+            esac
+
+            jq -n --arg env "$TARGET_ENV" --arg region "$TARGET_REGION" --arg action "$TARGET_ACTION" --arg component "$COMPONENT" \\
+                  --arg approver "$APPROVER" --arg started "$STARTED_BY" --arg ticket "$CHANGE_TICKET" \\
+                  --arg build "${BUILD_TAG:-manual}" --arg sha "$(cat "$STATE_DIR/git_sha" 2>/dev/null || echo unknown)" \\
+                  --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \\
+                  '{approved_at:$at, build:$build, commit:$sha, env:$env, region:$region, action:$action, component:$component,
+                    started_by:$started, approver:$approver, change_ticket:$ticket}' > "$STATE_DIR/approval.json"
+            log "approval recorded: $APPROVER · ticket=${CHANGE_TICKET:-n/a}"
+          '''.stripIndent())
+        }
+      }
+    }
+
+    stage('Apply saved plan (ordered)') {
+      when {
+        expression { env.HAS_STACKS == 'true' && env.TARGET_ACTION == 'apply' && !env.CHANGE_ID }
+      }
+      steps {
+        script {
+          runBash('''\
+            need terraform
+
+            apply_one() {
+              stack="$1"; id="$(stack_id "$stack")"; wd="$WORK/$id"
+              [ -f "$wd/tfplan" ] || die "no saved plan for $stack — the Plan stage must run first (a bare apply is forbidden)"
+              load_aws "$stack"
+              cd "$wd"
+              terraform apply -input=false -no-color -lock-timeout=5m tfplan 2>&1 | sed "s|^|[$id] |"
+              exit 0
+            }
+            export -f apply_one
+
+            order=platform
+            [ -f "$CI_DIR/order/$order.order" ] || die "no such order file: ci/order/$order.order"
+            [ -s "$APPLY_FILE" ] || { log "no stack has changes — nothing to apply"; exit 0; }
+            [ "$TARGET_ACTION" = apply ] || die "refusing to apply: ACTION is '$TARGET_ACTION'"
+            git_auth
+
+            queue="$STATE_DIR/apply_queue_$order.txt"; : > "$queue"
+            while IFS= read -r s; do
+              [ -n "$s" ] || continue
+              r="$(order_of_stack "$order" "$s")"
+              if [ -n "$r" ]; then printf '%s\\t%s\\n' "$r" "$s" >> "$queue"; fi
+            done < "$APPLY_FILE"
+            [ -s "$queue" ] || { log "nothing to apply under order '$order'"; exit 0; }
+            sort -t "$(printf '\\t')" -k1,1n -k2,2 "$queue" -o "$queue"
+
+            done_list="$STATE_DIR/applied_stacks.txt"; touch "$done_list"
+            for r in $(cut -f1 "$queue" | sort -nu); do
+              group="$(awk -F'\\t' -v r="$r" '$1 == r { print $2 }' "$queue")"
+              log "── apply group (rank $r): $(printf '%s' "$group" | tr '\\n' ' ')"
+              if ! printf '%s\\n' "$group" | xargs -P "$PLAN_PARALLEL" -I{} bash -c '. .ci/lib.sh; apply_one "$1"' _ {}; then
+                log "applied so far:"; sed 's/^/    ✔ /' "$done_list" >&2
+                log "still pending:"; awk -F'\\t' -v r="$r" '$1 >= r { print "    … " $2 }' "$queue" >&2
+                die "apply FAILED in group $r — NO auto-rollback. The state is partially applied: page a human; recover by fixing forward or git revert + re-apply"
+              fi
+              printf '%s\\n' "$group" >> "$done_list"
+            done
+            log "apply OK ($order): $(grep -c . "$queue") stack(s)"
+          '''.stripIndent())
+        }
+      }
+    }
+
+    stage('Verify & publish') {
+      when {
+        expression { env.HAS_STACKS == 'true' && env.TARGET_ACTION == 'apply' && !env.CHANGE_ID }
+      }
+      steps {
+        script {
+          runBash('''\
+            layer_name=platform
+            need terraform jq aws git
+            applied="$STATE_DIR/applied_stacks.txt"
+            [ -s "$applied" ] || { log "nothing was applied — nothing to verify"; exit 0; }
+            git_auth
+            sha="$(cat "$STATE_DIR/git_sha" 2>/dev/null || git -C "$ROOT" rev-parse HEAD)"
+            problems=0
+            flag() { warn "$*"; problems=$((problems + 1)); }
+
+            while IFS= read -r s; do
+              [ -n "$s" ] || continue
+              wd="$WORK/$(stack_id "$s")"
+              set +e; ( load_aws "$s"; cd "$wd" && terraform plan -input=false -no-color -lock-timeout=5m -detailed-exitcode >"$wd/verify-plan.txt" 2>&1 ); rc=$?; set -e
+              case "$rc" in
+                0) log "converged: $s" ;;
+                2) flag "$s still shows a diff after apply (perpetual diff or concurrent change) — see .work/$(stack_id "$s")/verify-plan.txt" ;;
+                *) flag "$s: the verification plan itself failed (rc=$rc)" ;;
+              esac
+            done < "$applied"
+
+            while IFS= read -r s; do
+              [ -n "$s" ] || continue
+              mod="$( { grep -hoE '//[A-Za-z0-9_-]+/[A-Za-z0-9_-]+\\?ref=' "$LIVE/$s/main.tf" || true; } | head -1 | sed -E 's#^//##; s#\\?ref=$##')"
+              [ -n "$mod" ] && [ -f "$MODS/$mod/main.tf" ] || continue
+              tpl="$( { grep -hoE 'ssm_prefix *= *"[^"]+"' "$MODS/$mod/main.tf" || true; } | head -1 | sed -E 's/.*= *"//; s/"$//')"
+              [ -n "$tpl" ] || continue
+              scope="$(printf '%s' "$s" | cut -d/ -f2)"; region="$(printf '%s' "$s" | cut -d/ -f3)"
+              case "$scope" in _shared) envname=shared ;; *) envname="$scope" ;; esac
+              prefix="$(printf '%s' "$tpl" | sed "s#\\${var.org}#$ORG#g; s#\\${var.env}#$envname#g")"
+              n="$( ( eval "$(exec_env "$s")"; aws ssm get-parameters-by-path --path "$prefix" --recursive --region "${region/_/eu-west-1}" --query 'length(Parameters)' --output text ) 2>/dev/null || echo 0)"
+              if [ "${n:-0}" -ge 1 ] 2>/dev/null; then log "contract ok: $prefix ($n keys)"; else flag "no SSM keys under $prefix after applying $s — downstream layers will fail"; fi
+            done < "$applied"
+
+            smoke_url="${SMOKE_URL:-}"
+            case "$layer_name" in
+              platform)
+                { grep -E '/eks-cluster$' "$applied" || true; } | while IFS= read -r s; do
+                  env_="$(printf '%s' "$s" | cut -d/ -f2)"; region="$(printf '%s' "$s" | cut -d/ -f3)"
+                  st="$( ( eval "$(exec_env "$s")"; aws eks describe-cluster --name "$env_-eks" --region "$region" --query cluster.status --output text ) 2>/dev/null || echo UNKNOWN)"
+                  [ "$st" = ACTIVE ] && log "EKS $env_-eks is ACTIVE" || { warn "EKS $env_-eks status is $st"; exit 1; }
+                done || problems=$((problems + 1)) ;;
+            esac
+
+            now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            cut -d/ -f1-2 "$applied" | sort -u | while IFS= read -r ls_; do
+              L="${ls_%%/*}"; scope="${ls_#*/}"
+              first="$(grep -m1 "^$ls_/" "$applied")"
+              region="$(printf '%s' "$first" | cut -d/ -f3)"; [ "$region" = _ ] && region=eu-west-1
+              case "$scope" in _shared) envname=shared ;; *) envname="$scope" ;; esac
+              ( eval "$(exec_env "$first")"
+                aws ssm put-parameter --name "/$ORG/$envname/ops/last_apply/$layer_name" --type String --overwrite --region "$region" \\
+                    --value "commit=$sha build=${BUILD_TAG:-manual} at=$now" >/dev/null ) || flag "could not write the last_apply marker for $ls_"
+              git -C "$ROOT" tag -f "deployed/$L/$scope" "$sha" >/dev/null
+              if [ "${PUSH_DEPLOY_TAGS:-false}" = true ] && git -C "$ROOT" remote get-url origin >/dev/null 2>&1; then
+                git -C "$ROOT" push -f origin "refs/tags/deployed/$L/$scope" >/dev/null 2>&1 || flag "could not push tag deployed/$L/$scope"
+              fi
+              log "marked deployed/$L/$scope = $(printf '%s' "$sha" | cut -c1-12)"
+            done
+
+            if [ "$problems" != 0 ]; then
+              [ "${VERIFY_STRICT:-false}" = true ] && die "verification found $problems problem(s) (VERIFY_STRICT=true)"
+              warn "verification finished with $problems warning(s) — the apply itself succeeded"
+            else
+              log "verify & publish OK"
+            fi
+          '''.stripIndent())
+        }
+      }
+    }
+  }
+
+  post {
+    success {
+      script {
+        notify('SUCCESS',
+          "${env.TARGET_ENV}/${env.LAYER} ${env.TARGET_ACTION} OK — " +
+          "nothing-to-do=${env.HAS_STACKS == 'false'} " +
+          "approver=${env.APPROVER ?: 'n/a'} " +
+          "ticket=${env.CHANGE_TICKET ?: 'n/a'} " +
+          "commit=${(env.GIT_COMMIT ?: '').take(8)}")
+      }
+    }
+    failure {
+      script {
+        notify('FAILURE',
+          "${env.TARGET_ENV}/${env.LAYER} ${env.TARGET_ACTION} FAILED at '${env.STAGE_NAME}' — " +
+          "no auto-rollback; a human decides (fix forward or git revert + re-apply)")
+      }
+    }
+    aborted {
+      script {
+        notify('ABORTED',
+          "${env.TARGET_ENV}/${env.LAYER} ${env.TARGET_ACTION} aborted (approval timeout / manual)")
+      }
+    }
+    unstable {
+      script {
+        notify('WARN', "${env.TARGET_ENV}/${env.LAYER} finished UNSTABLE")
+      }
+    }
+    cleanup {
+      script {
+        runBash('''\
+          rm -f "$STATE_DIR"/aws-*.env "$STATE_DIR/gitconfig" "$STATE_DIR/approval.tmp"
+          find "$STATE_DIR" -maxdepth 1 \\( -name 'kubeconfig*' -o -name 'helm-values-*' -o -name 'boot-state' \\) -exec rm -rf {} + 2>/dev/null || true
+          find "$WORK" \\( -name 'tfplan' -o -name 'tfplan.json' -o -name 'terraform.tfstate*' -o -name '.terraform' \\) -prune -exec rm -rf {} + 2>/dev/null || true
+          log "build credentials and saved plans removed"
+        '''.stripIndent())
+      }
+    }
+  }
+}
+
+
+def runBash(String body) {
+  dir(env.IAC_DIR) {
+    writeFile(file: '.ci/lib.sh', text: libSh())
+    sh("#!/usr/bin/env bash\n. .ci/lib.sh\n" + body)
+  }
+}
+
+def pfx() {
+  return env.IAC_DIR == '.' ? '' : env.IAC_DIR + '/'
+}
+
+def hasStacks() {
+  return fileExists("${pfx()}.ci/changed_stacks.txt") &&
+         readFile("${pfx()}.ci/changed_stacks.txt").trim() != ''
+}
+
+def notify(String status, String msg) {
+  withEnv(["NOTIFY_STATUS=${status}", "NOTIFY_MSG=${msg}"]) {
+    runBash('''\
+      status="$NOTIFY_STATUS"; msg="$NOTIFY_MSG"
+
+      case "$status" in SUCCESS) icon="✅" ;; FAILURE) icon="❌" ;; ABORTED) icon="⛔" ;; *) icon="⚠️" ;; esac
+      line="$icon [$status] $msg  ·  ${BUILD_URL:-local-run}"
+      log "notify: $line"
+
+      [ -n "${CHAT_WEBHOOK_URL:-}" ] || exit 0
+      need curl jq
+      curl -fsS -m 15 -X POST -H 'Content-Type: application/json' -d "$(jq -n --arg t "$line" '{text:$t}')" "$CHAT_WEBHOOK_URL" >/dev/null \\
+        || warn "chat notification failed (the build result is NOT affected)"
+    '''.stripIndent())
+  }
+}
+
+def readConfigParameter(String key, String file) {
+  return sh(
+    returnStdout: true,
+    script: "grep -E '^${key}=' '${file}' | head -1 | cut -d= -f2- | tr -d '[:space:]\"' || true"
+  ).trim()
+}
+
+def needsApproval() {
+  if (env.TARGET_ACTION != 'apply')                  { return false }
+  if (env.TARGET_ENV in ['prod', '_shared'])         { return true }
+  if (env.TARGET_ENV in ['stage', 'stage-dr'])       { return !params.AUTO_APPROVE }
+  return false
+}
+
+
+
+def libSh() {
+  return '''\
+    set -euo pipefail
+
+    ROOT="$PWD"
+    CI_DIR="$ROOT/pipelines/ci"
+    LIVE="$ROOT/infra-live"
+    MODS="$ROOT/infra-modules"
+    STATE_DIR="$ROOT/.ci"
+    WORK="$ROOT/.work"
+    mkdir -p "$STATE_DIR" "$WORK"
+
+    ORG="${ORG:-acme}"
+    TARGET_ENV="${TARGET_ENV:-${ENV:-any}}"
+    TARGET_REGION="${TARGET_REGION:-${REGION:-any}}"
+    TARGET_ACTION="${TARGET_ACTION:-${ACTION:-plan}}"
+    COMPONENT="${COMPONENT:-all}"
+    PLAN_PARALLEL="${PLAN_PARALLEL:-4}"
+    CHANGED_FILE="$STATE_DIR/changed_stacks.txt"
+    APPLY_FILE="$STATE_DIR/apply_stacks.txt"
+
+    log()  { printf '[%s] %s\\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
+    warn() { log "WARN: $*"; }
+    die()  { log "ERROR: $*"; exit 1; }
+    need() { local b; for b in "$@"; do command -v "$b" >/dev/null 2>&1 || die "required tool missing on the agent: $b"; done; }
+
+    stack_id() { printf '%s' "$1" | sed 's|/|__|g'; }
+
+    layer_orders() {
+      case "$1" in
+        L3-platform-data)     echo "platform" ;;
+        *) die "unknown layer folder: $1" ;;
+      esac
+    }
+
+    order_table() {
+      awk '{ sub(/#.*/, "") } /^[[:space:]]*$/ { next }
+           { r++; n = split($0, a, "|");
+             for (i = 1; i <= n; i++) { gsub(/[[:space:]]/, "", a[i]); if (a[i] != "") print r "\\t" a[i] } }' \\
+        "$CI_DIR/order/$1.order"
+    }
+
+    order_of_stack() {
+      local comp; comp="$(basename "$2")"
+      order_table "$1" | awk -F'\\t' -v c="$comp" '$2 == c { print $1; exit }'
+    }
+
+    CONFIG_DIR="$ROOT/pipelines/config"
+    config_file() { printf '%s/%s-config.txt' "$CONFIG_DIR" "$1"; }
+    read_config() {
+      [ -f "$2" ] || die "config file not found: ${2#$ROOT/}"
+      grep -E "^$1=" "$2" | head -1 | cut -d= -f2- | tr -d '[:space:]"' || true
+    }
+    stack_scope() { printf '%s' "$1" | cut -d/ -f2; }
+
+    ALIASES="MGMT_ACCOUNT SECURITY_ACCOUNT LOGARCHIVE_ACCOUNT TOOLING_ACCOUNT NETWORK_ACCOUNT SHARED_ACCOUNT DEV_ACCOUNT QA_ACCOUNT STAGE_ACCOUNT PROD_ACCOUNT EMEA_ACCOUNT"
+
+    account_id() {
+      local scope key v
+      case "$1" in
+        DEV_ACCOUNT)     scope=dev;     key=AWS_ACCOUNT_ID ;;
+        QA_ACCOUNT)      scope=qa;      key=AWS_ACCOUNT_ID ;;
+        STAGE_ACCOUNT)   scope=stage;   key=AWS_ACCOUNT_ID ;;
+        PROD_ACCOUNT)    scope=prod;    key=AWS_ACCOUNT_ID ;;
+        SHARED_ACCOUNT)  scope=_shared; key=AWS_ACCOUNT_ID ;;
+        TOOLING_ACCOUNT) scope=_shared; key=SHARED_ACCOUNT_ID ;;
+        *) die "alias $1 has no config entry in this copy (add a case to account_id in lib.sh)" ;;
+      esac
+      if [ "$key" = AWS_ACCOUNT_ID ] && [ "$scope" = "${TARGET_ENV:-}" ] && [ -n "${AWS_ACCOUNT_ID:-}" ]; then
+        v="$AWS_ACCOUNT_ID"
+      elif [ "$key" = SHARED_ACCOUNT_ID ] && [ -n "${SHARED_ACCOUNT_ID:-}" ]; then
+        v="$SHARED_ACCOUNT_ID"
+      else
+        v="$(read_config "$key" "$(config_file "$scope")")"
+      fi
+      case "$v" in ''|REPLACE*) die "$key is not filled in: ${scope}-config.txt" ;; esac
+      printf '%s' "$v"
+    }
+
+    render_aliases() {
+      local dir="$1" mode="$2" a id i=0 sedargs=() left=""
+      for a in $ALIASES; do
+        i=$((i + 1))
+        if [ "$mode" = real ]; then id="$(account_id "$a" 2>/dev/null)" || { left="$left $a"; continue; }; else id="$(printf '9%011d' "$i")"; fi
+        sedargs+=(-e "s/$a/$id/g")
+      done
+      find "$dir" -type f \\( -name '*.tf' -o -name '*.yaml' -o -name '*.yml' -o -name '*.json' -o -name '*.tpl' -o -name '*.sh' -o -name '*.py' \\) \\
+           -not -path '*/.terraform/providers/*' -not -name 'tfplan.json' -print0 \\
+        | xargs -0 sed -i.bak "${sedargs[@]}"
+      find "$dir" -name '*.bak' -type f -delete
+      for a in $left; do
+        if grep -rqE --include='*.tf' "$a" "$dir" 2>/dev/null; then account_id "$a" >/dev/null; fi
+      done
+    }
+
+    git_auth() {
+      [ -n "${MODULES_REPO_TOKEN:-}" ] || return 0
+      export GIT_CONFIG_GLOBAL="$STATE_DIR/gitconfig"
+      git config --file "$GIT_CONFIG_GLOBAL" url."https://x-access-token:${MODULES_REPO_TOKEN}@git.example.com/".insteadOf "https://git.example.com/"
+      chmod 600 "$GIT_CONFIG_GLOBAL"
+    }
+
+    TF_INIT_ARGS=(-input=false -no-color)
+    if [ -n "${TF_PLUGIN_DIR:-}" ]; then TF_INIT_ARGS+=("-plugin-dir=$TF_PLUGIN_DIR"); fi
+
+    make_workdir() {
+      local stack="$1" live="${2:-$LIVE}" mods="${3:-$MODS}" dest="${4:-$WORK}" wd refpat='main' rel prefix
+      [ "${LOCAL_MODULES_ALL:-false}" = true ] && refpat='[A-Za-z0-9._-]+'
+      wd="$dest/$(stack_id "$stack")"
+      rm -rf "$wd"; mkdir -p "$wd"
+      cp -R "$live/$stack/." "$wd/"
+      rel="${wd#$ROOT/}"; prefix="$(printf '%s' "$rel" | awk -F/ '{ s = ""; for (i = 1; i <= NF; i++) s = s "../"; print s }')"
+      find "$wd" -name '*.tf' -print0 | xargs -0 sed -i.bak -E \\
+        "s#git::https://git\\.example\\.com/infra-modules\\.git//([A-Za-z0-9_./-]+)\\?ref=$refpat#${prefix}${mods#$ROOT/}/\\1#g"
+      find "$wd" -name '*.bak' -type f -delete
+      printf '%s' "$wd"
+    }
+
+    load_aws() {
+      local scope f; scope="$(stack_scope "${1:?load_aws needs a stack path}")"; f="$STATE_DIR/aws-$scope.env"
+      [ -f "$f" ] || die "no AWS session for scope '$scope' — the Authenticate stage must run first"
+      unset AWS_PROFILE
+      . "$f"
+      export TF_IN_AUTOMATION=1 TF_INPUT=0
+    }
+    exec_env() {
+      local f; f="$STATE_DIR/aws-$(stack_scope "$1").env"
+      [ -f "$f" ] || die "no AWS session for scope '$(stack_scope "$1")' — run the Authenticate stage first"
+      cat "$f"
+    }
+  '''.stripIndent()
+}

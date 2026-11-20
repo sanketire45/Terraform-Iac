@@ -1,73 +1,87 @@
 #!/usr/bin/env bash
 # ════════════════════════════════════════════════════════════════════════
-#  STAGE 7 · Authenticate     (NO static keys anywhere)
-#  Chain : Jenkins OIDC token ──sts:AssumeRoleWithWebIdentity──▶ ci-bootstrap (TOOLING account, 1h)
-#          └─ the AWS provider in every leaf then does the second hop: ──sts:AssumeRole + ExternalId──▶ terraform-exec (target account)
-#  Why   : each target account trusts ONLY ci-bootstrap (+ the ExternalId). A leaf can therefore only ever touch the account its
-#          own provider block names; there is no key to leak, and every session is attributable in CloudTrail by its name.
-#  Env   : OIDC_TOKEN (Jenkins OpenID-Connect-Provider credential, bound as a secret)  ·  ACCOUNT_MAP_FILE (alias → 12-digit id)
-#          BUILD_TAG (Jenkins)  ·  TF_VAR_external_id (via TF_SECRETS_FILE)  ·  FORCE_AUTH=true (drift job: no stack list)
-#  Writes: .ci/aws.env (chmod 600, ci-bootstrap session; sourced by every later script via load_aws)
+#  STAGE 7 · Authenticate     (Whirlpool style: config file → ONE sts assume-role per environment)
+#
+#  Whirlpool (lib/commonInfraFunctions.groovy → awsAuthentication):
+#      config_file = "config/${ENV_STAGE}-config.txt"
+#      account_id  = readConfigParameter("AWS_ACCOUNT_ID", config_file)
+#      role        = grep JENKINS_ROLE_ARN= config_file
+#      aws sts assume-role --role-arn arn:aws:iam::<account_id>:role/<role> --role-session-name jenkins
+#      → AccessKeyId / SecretAccessKey / SessionToken saved into an AWS CLI profile
+#  Here (same idea, same four steps):
+#      config file  : pipelines/config/<scope>-config.txt            (scope = dev | qa | stage | prod | _shared)
+#      account/role : AWS_ACCOUNT_ID and JENKINS_ROLE_ARN from that file
+#      assume-role  : the Jenkins AGENT's own AWS identity (instance role / profile on the node) calls sts:AssumeRole
+#      saved to     : .ci/aws-<scope>.env  (chmod 600) — Terraform reads the variables, so no CLI profile is needed
+#
+#  Reads : .ci/changed_stacks.txt · pipelines/config/<scope>-config.txt
+#  Writes: .ci/aws-<scope>.env, one per distinct scope in the stack list (a PR build can touch several; a normal run has one)
+#  Env   : BUILD_TAG (Jenkins, used in the session name) · FORCE_AUTH=true (drift job: no stack list)
 # ════════════════════════════════════════════════════════════════════════
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
-[ -s "$CHANGED_FILE" ] || [ "${FORCE_AUTH:-false}" = true ] || { log "nothing to deploy — no credentials requested"; exit 0; }   # FORCE_AUTH=true: the drift job authenticates for ALL stacks
+[ -s "$CHANGED_FILE" ] || [ "${FORCE_AUTH:-false}" = true ] || { log "nothing to deploy — no credentials requested"; exit 0; }
 need aws jq
-[ -n "${OIDC_TOKEN:-}" ] || die "OIDC_TOKEN is empty — bind the Jenkins OIDC credential to the job"
-load_tf_secrets
-[ -n "${TF_VAR_external_id:-}" ] || die "TF_VAR_external_id is empty — it must be in TF_SECRETS_FILE (the terraform-exec trust policy requires the ExternalId)"
 
-tooling="$(account_id TOOLING_ACCOUNT)"
-# the session name is what CloudTrail shows for every API call → "which Jenkins build did this?"
-session="$(printf 'jenkins-%s' "${BUILD_TAG:-manual}" | tr -c 'A-Za-z0-9+=,.@_-' '-' | cut -c1-64)"
+# 0. who is Jenkins right now?  (Whirlpool relies on this too: the agent must already have an AWS identity)
+me="$(aws sts get-caller-identity --query Arn --output text 2>/dev/null)" \
+  || die "the Jenkins agent has no AWS identity — give the node an instance role / profile / keys that may call sts:AssumeRole on the role named in JENKINS_ROLE_ARN"
+log "Jenkins agent identity: $(printf '%s' "$me" | sed -E 's#:[0-9]{12}:#:<account>:#')"
 
-# make sure nothing ambient (a stale profile, an instance role) is used for the exchange
-unset AWS_PROFILE AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+session="$(printf 'jenkins-%s' "${BUILD_TAG:-manual}" | tr -c 'A-Za-z0-9+=,.@_-' '-' | cut -c1-64)"   # shows up in CloudTrail
 
-creds="$(aws sts assume-role-with-web-identity \
-          --role-arn "arn:aws:iam::$tooling:role/ci-bootstrap" \
-          --role-session-name "$session" \
-          --web-identity-token "$OIDC_TOKEN" \
-          --duration-seconds 3600 --output json)" || die "OIDC → ci-bootstrap failed (check the issuer / sub / aud conditions of the role's trust policy)"
+# 1. which environments (scopes) do the changed stacks belong to?   L3-platform-data/<dev>/eu-west-1/kms → dev
+if [ -s "$CHANGED_FILE" ]; then scopes="$(cut -d/ -f2 "$CHANGED_FILE" | sort -u)"; else scopes="${TARGET_ENV:?}"; fi
 
-umask 077
-{
-  printf 'export AWS_ACCESS_KEY_ID=%s\n'     "$(printf '%s' "$creds" | jq -r .Credentials.AccessKeyId)"
-  printf 'export AWS_SECRET_ACCESS_KEY=%s\n' "$(printf '%s' "$creds" | jq -r .Credentials.SecretAccessKey)"
-  printf 'export AWS_SESSION_TOKEN=%s\n'     "$(printf '%s' "$creds" | jq -r .Credentials.SessionToken)"
-  printf 'export AWS_DEFAULT_REGION=%s\n'    "${AWS_DEFAULT_REGION:-eu-west-1}"
-} > "$STATE_DIR/aws.env"
+# 2. for each scope: read its config file, assume the role in that account, save the session
+for scope in $scopes; do
+  cfg="$(config_file "$scope")"
+  if [ "$scope" = "${TARGET_ENV:-}" ] && [ -n "${AWS_ACCOUNT_ID:-}" ]; then
+    account="$AWS_ACCOUNT_ID"; role="$JENKINS_ROLE_ARN"; region="$AWS_REGION"
+  else
+    account="$(read_config AWS_ACCOUNT_ID   "$cfg")"
+    role="$(read_config    JENKINS_ROLE_ARN "$cfg")"
+    region="$(read_config  AWS_REGION       "$cfg")"
+  fi
+  for pair in "AWS_ACCOUNT_ID=$account" "JENKINS_ROLE_ARN=$role" "AWS_REGION=$region"; do
+    case "${pair#*=}" in ''|REPLACE*) die "${pair%%=*} is not filled in: ${cfg#$ROOT/}" ;; esac
+  done
 
-load_aws
-log "authenticated as: $(aws sts get-caller-identity --query Arn --output text | sed -E 's#:[0-9]{12}:#:<tooling>:#')"
+  # (Whirlpool: ASSUMED_ROLE=`aws sts assume-role --role-arn arn:aws:iam::${account_id}:role/${roletoassume} --role-session-name jenkins`)
+  creds="$(aws sts assume-role \
+            --role-arn "arn:aws:iam::$account:role/$role" \
+            --role-session-name "$session" \
+            --duration-seconds 3600 --output json)" \
+    || die "cannot assume role/$role in the '$scope' account — does the role's trust policy allow the Jenkins agent identity above?"
 
-# fail EARLY and clearly if any stack's target account does not accept us (a bad ExternalId or a missing terraform-exec role)
-while IFS= read -r s; do
-  [ -n "$s" ] || continue
-  alias_="$(grep -hoE 'arn:aws:iam::[A-Z_]+:role/terraform-exec' "$LIVE/$s/main.tf" | head -1 | sed -E 's#arn:aws:iam::([A-Z_]+):.*#\1#')"
-  echo "$alias_"
-done < "$CHANGED_FILE" | sort -u | while IFS= read -r a; do
-  [ -n "$a" ] || continue
-  aws sts assume-role --role-arn "arn:aws:iam::$(account_id "$a"):role/terraform-exec" --role-session-name "$session" \
-      --external-id "$TF_VAR_external_id" --duration-seconds 900 --query Credentials.Expiration --output text >/dev/null \
-    || die "cannot assume terraform-exec in $a — check the ExternalId and that ci-oidc-roles was applied there"
-  log "terraform-exec reachable in $a"
+  # (Whirlpool: python one-liners pick the three values, then `aws configure set … --profile`)
+  umask 077
+  {
+    printf 'export AWS_ACCESS_KEY_ID=%s\n'     "$(printf '%s' "$creds" | jq -r .Credentials.AccessKeyId)"
+    printf 'export AWS_SECRET_ACCESS_KEY=%s\n' "$(printf '%s' "$creds" | jq -r .Credentials.SecretAccessKey)"
+    printf 'export AWS_SESSION_TOKEN=%s\n'     "$(printf '%s' "$creds" | jq -r .Credentials.SessionToken)"
+    printf 'export AWS_DEFAULT_REGION=%s\n'    "$region"
+  } > "$STATE_DIR/aws-$scope.env"
+
+  # prove the saved session works and really is the target account (a wrong account id in the config file fails HERE, in seconds)
+  ( . "$STATE_DIR/aws-$scope.env"
+    got="$(aws sts get-caller-identity --query Account --output text)" || exit 1
+    [ "$got" = "$account" ] || { echo "session is in a different account than AWS_ACCOUNT_ID" >&2; exit 1; } ) \
+    || die "the '$scope' session does not work or is not in AWS_ACCOUNT_ID — check ${cfg#$ROOT/}"
+  log "scope '$scope': assumed role/$role (account from ${cfg#$ROOT/}) → .ci/aws-$scope.env"
 done
 
 # ════════════════════════════════════════════════════════════════════════
 # EXPLAINED
-#   OIDC_TOKEN                 a short-lived, signed JWT minted by Jenkins for THIS build. It carries claims (iss, aud, sub). AWS checks the
-#                              signature against the issuer registered in IAM (aws_iam_openid_connect_provider) and the role's trust
-#                              conditions on aud + sub. Nothing secret is stored in Jenkins except the ability to mint the token.
-#   assume-role-with-web-identity   the call that swaps the token for temporary credentials. It needs NO prior AWS credentials,
-#                              hence the `unset AWS_*` above — we want to prove the exchange works from nothing.
-#   --role-session-name        becomes part of the assumed-role ARN in CloudTrail: assumed-role/ci-bootstrap/jenkins-<BUILD_TAG>.
-#                              The character set is restricted by AWS and the limit is 64, hence the tr/cut.
-#                              (AssumeRoleWithWebIdentity cannot carry session tags; the session name is the attribution handle.)
-#   umask 077 + chmod 600      the credentials file is readable only by the build user; it lives in .ci/ (gitignored) and dies with the
-#                              workspace. Jenkins masks secret-text credentials in the console log, but these derived values are not
-#                              masked — never `cat` this file.
-#   the probe loop             assumes terraform-exec once per distinct target account BEFORE any plan runs. A wrong ExternalId then
-#                              fails in seconds with a clear message, not 20 minutes into a plan.
-#   why no second hop here     the leaf's `provider "aws" { assume_role { … external_id } }` performs it; plan/apply therefore run with
-#                              the target account's permissions only inside the terraform process.
+#   config file per scope      same idea as Whirlpool's config/${ENV_STAGE}-config.txt: the values that differ per environment live in a
+#                              small KEY=value file, never in the scripts. read_config (lib.sh) = their readConfigParameter (grep KEY= | sed).
+#   the agent's own identity   `aws sts assume-role` with NO token and NO keys given: the AWS CLI uses whatever the node already has
+#                              (instance profile, a profile, env keys). That is Whirlpool's model; step 0 above prints it so you can see it.
+#   --role-session-name        Whirlpool uses the constant "jenkins"; we add BUILD_TAG so CloudTrail shows WHICH build made each call.
+#   --duration-seconds 3600    one hour. Plan + approval wait + apply must finish inside it (a longer approval needs a fresh Authenticate).
+#   .ci/aws-<scope>.env        what Whirlpool does with `aws configure set … --profile`, but as plain `export` lines. lib.sh `load_aws <stack>`
+#                              sources the file of that stack's scope; `exec_env <stack>` prints it for the AWS-CLI smoke tests.
+#   umask 077                  the file is readable only by the build user; cleanup.sh deletes it at the end of every build.
+#   one hop only               the leaves' provider blocks have NO assume_role any more: Terraform simply uses the exported session, so
+#                              plan/apply act with the permissions of role/JENKINS_ROLE_ARN in that account. The state bucket lives in
+#                              SHARED_ACCOUNT_ID, so its bucket + KMS key policies must allow these roles (one policy statement per env role).
 # ════════════════════════════════════════════════════════════════════════

@@ -63,32 +63,61 @@ order_of_stack() {
   order_table "$1" | awk -F'\t' -v c="$comp" '$2 == c { print $1; exit }'
 }
 
-# ── account aliases: git only ever holds DEV_ACCOUNT, PROD_ACCOUNT … ; the real ids come from a CI secret file ──
-# ACCOUNT_MAP_FILE (Jenkins "secret file" credential) has lines like  DEV_ACCOUNT=<12 digits>
+# ── config files (Whirlpool style): pipelines/config/<scope>-config.txt, one KEY=value per line ──
+# Whirlpool:  config_file = "config/${ENV_STAGE}-config.txt"   +   gvInfra.readConfigParameter("AWS_ACCOUNT_ID", config_file)
+# Here     :  config_file dev   →  .../pipelines/config/dev-config.txt   +   read_config AWS_ACCOUNT_ID "$(config_file dev)"
+CONFIG_DIR="$ROOT/pipelines/config"
+config_file() { printf '%s/%s-config.txt' "$CONFIG_DIR" "$1"; }          # config_file <scope>   scope = dev | qa | stage | prod | _shared
+read_config() {                                                           # read_config KEY FILE  → the text after "KEY="
+  [ -f "$2" ] || die "config file not found: ${2#$ROOT/}"
+  grep -E "^$1=" "$2" | head -1 | cut -d= -f2- | tr -d '[:space:]"' || true
+}
+stack_scope() { printf '%s' "$1" | cut -d/ -f2; }                        # L3-platform-data/dev/eu-west-1/kms → dev
+
+# ── account aliases: git only ever holds DEV_ACCOUNT, PROD_ACCOUNT … ; the real ids come from the config files ──
 ALIASES="MGMT_ACCOUNT SECURITY_ACCOUNT LOGARCHIVE_ACCOUNT TOOLING_ACCOUNT NETWORK_ACCOUNT SHARED_ACCOUNT DEV_ACCOUNT QA_ACCOUNT STAGE_ACCOUNT PROD_ACCOUNT EMEA_ACCOUNT"
 
-account_id() {   # account_id DEV_ACCOUNT → 12-digit id from the secret map
-  [ -n "${ACCOUNT_MAP_FILE:-}" ] && [ -f "$ACCOUNT_MAP_FILE" ] || die "ACCOUNT_MAP_FILE not set — the real account ids live only in the CI secret store"
-  local v; v="$(grep -E "^$1=" "$ACCOUNT_MAP_FILE" | head -1 | cut -d= -f2- | tr -d '[:space:]"')"
-  [ -n "$v" ] || die "no id for $1 in the account map"
+account_id() {   # account_id DEV_ACCOUNT → the 12-digit id, read from the matching config file
+  local scope key v
+  case "$1" in
+    DEV_ACCOUNT)     scope=dev;     key=AWS_ACCOUNT_ID ;;
+    QA_ACCOUNT)      scope=qa;      key=AWS_ACCOUNT_ID ;;
+    STAGE_ACCOUNT)   scope=stage;   key=AWS_ACCOUNT_ID ;;
+    PROD_ACCOUNT)    scope=prod;    key=AWS_ACCOUNT_ID ;;
+    SHARED_ACCOUNT)  scope=_shared; key=AWS_ACCOUNT_ID ;;
+    TOOLING_ACCOUNT) scope=_shared; key=SHARED_ACCOUNT_ID ;;    # the account that holds the state bucket
+    *) die "alias $1 has no config entry in this copy (add a case to account_id in lib.sh)" ;;
+  esac
+  if [ "$key" = AWS_ACCOUNT_ID ] && [ "$scope" = "${TARGET_ENV:-}" ] && [ -n "${AWS_ACCOUNT_ID:-}" ]; then
+    v="$AWS_ACCOUNT_ID"
+  elif [ "$key" = SHARED_ACCOUNT_ID ] && [ -n "${SHARED_ACCOUNT_ID:-}" ]; then
+    v="$SHARED_ACCOUNT_ID"
+  else
+    v="$(read_config "$key" "$(config_file "$scope")")"
+  fi
+  case "$v" in ''|REPLACE*) die "$key is not filled in: ${scope}-config.txt" ;; esac
   printf '%s' "$v"
 }
 
 # render_aliases <dir> real|dummy
-#   real  : replace every ALIAS with the real id            (plan / apply — needs ACCOUNT_MAP_FILE)
+#   real  : replace every ALIAS with the real id            (plan / apply — ids come from pipelines/config/*-config.txt)
 #   dummy : replace with obviously-fake sequential ids       (validate / lint / scan — no secrets needed, but ARNs stay well-formed)
 #   Edits only the temp working copy, never the git checkout; skips .terraform/providers (binaries).
 render_aliases() {
-  local dir="$1" mode="$2" a id i=0 sedargs=()
+  local dir="$1" mode="$2" a id i=0 sedargs=() left=""
   for a in $ALIASES; do
     i=$((i + 1))
-    if [ "$mode" = real ]; then id="$(account_id "$a")"; else id="$(printf '9%011d' "$i")"; fi   # dummy: "9" + 11 digits = a fake but well-formed 12-digit id (and no 12-digit literal in git)
+    if [ "$mode" = real ]; then id="$(account_id "$a" 2>/dev/null)" || { left="$left $a"; continue; }; else id="$(printf '9%011d' "$i")"; fi   # dummy: "9" + 11 digits = a fake but well-formed 12-digit id (and no 12-digit literal in git)
     sedargs+=(-e "s/$a/$id/g")   # plain substring is safe: no alias is part of another alias or a longer word
   done
   find "$dir" -type f \( -name '*.tf' -o -name '*.yaml' -o -name '*.yml' -o -name '*.json' -o -name '*.tpl' -o -name '*.sh' -o -name '*.py' \) \
        -not -path '*/.terraform/providers/*' -not -name 'tfplan.json' -print0 \
     | xargs -0 sed -i.bak "${sedargs[@]}"
   find "$dir" -name '*.bak' -type f -delete
+  # an alias that no config file can resolve and that a leaf really uses = a clear error here, not a cryptic AWS error later
+  for a in $left; do
+    if grep -rqE --include='*.tf' "$a" "$dir" 2>/dev/null; then account_id "$a" >/dev/null; fi
+  done
 }
 
 # ── make Terraform able to fetch the modules repo over https with a token (never written into the repo or the plan) ──
@@ -132,24 +161,20 @@ make_workdir() {
 }
 
 # ── credentials ──
-# load_aws: the ci-bootstrap session written by assume_role.sh (OIDC → ci-bootstrap in TOOLING). The AWS PROVIDER does the second hop
-# (→ terraform-exec in the leaf's own account, with the ExternalId), so plan/apply need nothing more than this.
+# assume_role.sh (Stage 7) writes ONE file per scope:  .ci/aws-dev.env , .ci/aws-prod.env …  (Whirlpool writes one profile instead).
+# load_aws <stack> : load the session of THAT stack's scope into this shell → terraform / aws then act in that account.
 load_aws() {
-  [ -f "$STATE_DIR/aws.env" ] || die "no AWS session — the Authenticate stage (assume_role.sh) must run first"
-  . "$STATE_DIR/aws.env"
+  local scope f; scope="$(stack_scope "${1:?load_aws needs a stack path}")"; f="$STATE_DIR/aws-$scope.env"
+  [ -f "$f" ] || die "no AWS session for scope '$scope' — the Authenticate stage (assume_role.sh) must run first"
+  unset AWS_PROFILE
+  . "$f"
   export TF_IN_AUTOMATION=1 TF_INPUT=0
 }
-# exec_env <stack> → prints `export AWS_…` lines for terraform-exec in THAT stack's account (for the CLI smoke tests / helm diff).
-# The account is read from the leaf's own provider block, so there is one source of truth.
+# exec_env <stack> → prints the `export AWS_…` lines of that stack's scope (for the CLI smoke tests / kubectl / helm diff): eval "$(exec_env "$s")"
 exec_env() {
-  local alias_ acct creds
-  alias_="$(grep -hoE 'arn:aws:iam::[A-Z_]+:role/terraform-exec' "$LIVE/$1/main.tf" | head -1 | sed -E 's#arn:aws:iam::([A-Z_]+):.*#\1#')"
-  [ -n "$alias_" ] || die "no terraform-exec role in $1/main.tf"
-  acct="$(account_id "$alias_")"
-  creds="$(aws sts assume-role --role-arn "arn:aws:iam::$acct:role/terraform-exec" --role-session-name "${CI_SESSION_NAME:-ci-verify}" \
-           --external-id "${TF_VAR_external_id:?TF_VAR_external_id not set}" --duration-seconds 900 --output json)"
-  printf 'export AWS_ACCESS_KEY_ID=%s AWS_SECRET_ACCESS_KEY=%s AWS_SESSION_TOKEN=%s\n' \
-    "$(printf '%s' "$creds" | jq -r .Credentials.AccessKeyId)" "$(printf '%s' "$creds" | jq -r .Credentials.SecretAccessKey)" "$(printf '%s' "$creds" | jq -r .Credentials.SessionToken)"
+  local f; f="$STATE_DIR/aws-$(stack_scope "$1").env"
+  [ -f "$f" ] || die "no AWS session for scope '$(stack_scope "$1")' — run the Authenticate stage first"
+  cat "$f"
 }
 
 # leaf_ref <stack> → the ?ref= the leaf pins (main | v1.x | none)

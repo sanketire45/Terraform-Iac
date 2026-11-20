@@ -14,7 +14,7 @@ need jq
 [ "${SKIP_CLUSTER_GATE:-false}" != true ] || { warn "SKIP_CLUSTER_GATE=true — cluster gate bypassed"; exit 0; }
 
 checked=0
-grep -E '/eks-cluster$' "$CHANGED_FILE" | while IFS= read -r s; do
+{ grep -E '/eks-cluster$' "$CHANGED_FILE" || true; } | while IFS= read -r s; do   # `|| true`: no eks-cluster leaf in this run is NORMAL, not a failure (pipefail would otherwise abort the script)
   f="$WORK/$(stack_id "$s")/tfplan.json"; [ -f "$f" ] || die "no plan json for $s — run the plan stage first"
   before="$(jq -r '[.resource_changes[]? | select(.type == "aws_eks_cluster") | select(.change.actions | index("update")) | .change.before.version][0] // empty' "$f")"
   after="$( jq -r '[.resource_changes[]? | select(.type == "aws_eks_cluster") | select(.change.actions | index("update")) | .change.after.version ][0] // empty' "$f")"
@@ -28,7 +28,7 @@ grep -E '/eks-cluster$' "$CHANGED_FILE" | while IFS= read -r s; do
   log "$s: upgrade $before → $after (one minor) — asking EKS for upgrade insights"
 
   env_="$(printf '%s' "$s" | cut -d/ -f2)"; region="$(printf '%s' "$s" | cut -d/ -f3)"
-  need aws; load_aws; load_tf_secrets
+  need aws
   out="$( ( eval "$(exec_env "$s")"
             aws eks list-insights --cluster-name "$env_-eks" --region "$region" --filter categories=UPGRADE_READINESS \
                 --query 'insights[?insightStatus.status != `PASSING`].[name,insightStatus.status]' --output text ) )" \

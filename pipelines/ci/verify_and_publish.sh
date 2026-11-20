@@ -14,7 +14,7 @@ layer_name="${1:?usage: verify_and_publish.sh <layer-name>}"
 need terraform jq aws git
 applied="$STATE_DIR/applied_stacks.txt"
 [ -s "$applied" ] || { log "nothing was applied — nothing to verify"; exit 0; }
-load_aws; load_tf_secrets; git_auth
+load_tf_secrets; git_auth
 sha="$(cat "$STATE_DIR/git_sha" 2>/dev/null || git -C "$ROOT" rev-parse HEAD)"
 problems=0
 flag() { warn "$*"; problems=$((problems + 1)); }
@@ -23,7 +23,7 @@ flag() { warn "$*"; problems=$((problems + 1)); }
 while IFS= read -r s; do
   [ -n "$s" ] || continue
   wd="$WORK/$(stack_id "$s")"
-  set +e; ( cd "$wd" && terraform plan -input=false -no-color -lock-timeout=5m -detailed-exitcode >"$wd/verify-plan.txt" 2>&1 ); rc=$?; set -e
+  set +e; ( load_aws "$s"; cd "$wd" && terraform plan -input=false -no-color -lock-timeout=5m -detailed-exitcode >"$wd/verify-plan.txt" 2>&1 ); rc=$?; set -e
   case "$rc" in
     0) log "converged: $s" ;;
     2) flag "$s still shows a diff after apply (perpetual diff or concurrent change) — see .work/$(stack_id "$s")/verify-plan.txt" ;;
@@ -34,9 +34,9 @@ done < "$applied"
 # 2 ── contract keys exist where the module says it publishes them
 while IFS= read -r s; do
   [ -n "$s" ] || continue
-  mod="$(grep -hoE '//[A-Za-z0-9_-]+/[A-Za-z0-9_-]+\?ref=' "$LIVE/$s/main.tf" | head -1 | sed -E 's#^//##; s#\?ref=$##')"
+  mod="$( { grep -hoE '//[A-Za-z0-9_-]+/[A-Za-z0-9_-]+\?ref=' "$LIVE/$s/main.tf" || true; } | head -1 | sed -E 's#^//##; s#\?ref=$##')"
   [ -n "$mod" ] && [ -f "$MODS/$mod/main.tf" ] || continue
-  tpl="$(grep -hoE 'ssm_prefix *= *"[^"]+"' "$MODS/$mod/main.tf" | head -1 | sed -E 's/.*= *"//; s/"$//')"
+  tpl="$( { grep -hoE 'ssm_prefix *= *"[^"]+"' "$MODS/$mod/main.tf" || true; } | head -1 | sed -E 's/.*= *"//; s/"$//')"
   [ -n "$tpl" ] || continue                                   # this module publishes nothing
   scope="$(printf '%s' "$s" | cut -d/ -f2)"; region="$(printf '%s' "$s" | cut -d/ -f3)"
   case "$scope" in _shared) envname=shared ;; *) envname="$scope" ;; esac
@@ -49,7 +49,7 @@ done < "$applied"
 smoke_url="${SMOKE_URL:-}"
 case "$layer_name" in
   platform)
-    grep -E '/eks-cluster$' "$applied" | while IFS= read -r s; do
+    { grep -E '/eks-cluster$' "$applied" || true; } | while IFS= read -r s; do
       env_="$(printf '%s' "$s" | cut -d/ -f2)"; region="$(printf '%s' "$s" | cut -d/ -f3)"
       st="$( ( eval "$(exec_env "$s")"; aws eks describe-cluster --name "$env_-eks" --region "$region" --query cluster.status --output text ) 2>/dev/null || echo UNKNOWN)"
       [ "$st" = ACTIVE ] && log "EKS $env_-eks is ACTIVE" || { warn "EKS $env_-eks status is $st"; exit 1; }
@@ -68,10 +68,7 @@ case "$layer_name" in
       case "$code" in 2*|3*|401|403) log "smoke $smoke_url → HTTP $code" ;; *) flag "smoke $smoke_url → HTTP $code" ;; esac
     else log "SMOKE_URL not set — edge smoke test skipped"; fi ;;
   global)   "$CI_DIR/scp_lockout_check.sh" --post || flag "post-apply lock-out probe failed — see the message above" ;;
-  bootstrap) for a in $ALIASES; do
-               aws sts assume-role --role-arn "arn:aws:iam::$(account_id "$a"):role/terraform-exec" --role-session-name verify-bootstrap \
-                   --external-id "${TF_VAR_external_id:?}" --duration-seconds 900 >/dev/null 2>&1 && log "CI can assume terraform-exec in $a" || log "(no terraform-exec in $a yet)"
-             done ;;
+  bootstrap) log "bootstrap layer is not part of this copy — nothing to verify" ;;
 esac
 
 # 4 ── provenance: SSM marker + the git tag the NEXT run diffs from

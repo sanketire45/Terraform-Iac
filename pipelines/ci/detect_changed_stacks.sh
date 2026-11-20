@@ -79,7 +79,7 @@ else
         infra-modules/"$layer"/*/*)
           m="$(printf '%s' "$f" | cut -d/ -f2-3)"
           consumers "$m" >> "$tmp/cand.txt"
-          pinned="$(grep -rlE --include=main.tf "infra-modules\.git//$m\?ref=v" "$LIVE/$layer" 2>/dev/null | wc -l | tr -d ' ')"
+          pinned="$( { grep -rlE --include=main.tf "infra-modules\.git//$m\?ref=v" "$LIVE/$layer" 2>/dev/null || true; } | wc -l | tr -d ' ')"
           [ "$pinned" = 0 ] || log "module $m changed: $pinned leaf(s) pin a release tag and are NOT affected until their ?ref is bumped" ;;
         policy/*|pipelines/*)
           [ -n "${widened:-}" ] || log "$f changed (policy/pipeline code) → every leaf in scope is re-tested"; widened=1

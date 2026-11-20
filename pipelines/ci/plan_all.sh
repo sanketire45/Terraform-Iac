@@ -5,7 +5,7 @@
 #     working copy → terraform init → alias→real ids → terraform plan -out=tfplan → show (text + json) → one result line
 #  Then prints ONE summary table, flags destructive plans, and writes the list of leaves that really have changes.
 #
-#  Reads : .ci/changed_stacks.txt                       Needs: the Authenticate stage ran (.ci/aws.env), TF_SECRETS_FILE, ACCOUNT_MAP_FILE
+#  Reads : .ci/changed_stacks.txt                       Needs: the Authenticate stage ran (.ci/aws-<scope>.env) and pipelines/config/<scope>-config.txt filled in
 #  Writes: .work/<id>/{tfplan,tfplan.json,plan.txt,plan.log}   .ci/results/<id>.tsv   .ci/plan_summary.txt   .ci/apply_stacks.txt
 #  Rule  : the saved plan is the ONLY thing stage 11 applies. tfplan.json holds resolved (incl. sensitive) values → it stays in the
 #          workspace and is NOT archived; only the redacted plan.txt + the summary are.
@@ -18,6 +18,7 @@ if [ "${1:-}" = "--one" ]; then                       # ───── worker: 
   mkdir -p "$STATE_DIR/results"
   wd="$(make_workdir "$stack")"
   rm -f "$wd/plan.rc"
+  load_aws "$stack"                                       # the session of THIS stack's environment (written by assume_role.sh)
   (
     set +e; cd "$wd" || exit 0
     terraform init "${TF_INIT_ARGS[@]}"                || { echo 1 > plan.rc; exit 0; }
@@ -43,7 +44,7 @@ fi
 
 # ───── main ─────
 [ -s "$CHANGED_FILE" ] || { log "nothing to plan"; exit 0; }
-load_aws; load_tf_secrets; git_auth
+load_tf_secrets; git_auth
 rm -rf "$STATE_DIR/results"; mkdir -p "$STATE_DIR/results"; : > "$APPLY_FILE"; : > "$STATE_DIR/applied_stacks.txt"
 
 log "planning $(grep -c . "$CHANGED_FILE") stack(s), $PLAN_PARALLEL at a time"

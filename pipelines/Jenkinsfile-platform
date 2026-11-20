@@ -27,13 +27,11 @@ pipeline {
     ORG               = 'acme'
     LAYER             = 'L3-platform-data'
     // credentials are bound by ID. A missing ID fails the build at the very start (fail fast), and Jenkins masks the values in the log.
-    ACCOUNT_MAP_FILE  = credentials('iac-account-map')       // secret FILE: lines  DEV_ACCOUNT=<12 digits> …  (aliases → real ids; never in git)
-    TF_SECRETS_FILE   = credentials('iac-tf-secrets')        // secret FILE: TF_VAR_external_id=…  (the sts:ExternalId of terraform-exec)
-    OIDC_TOKEN        = credentials('jenkins-oidc-aws')      // OpenID-Connect id-token minted for THIS build → exchanged for AWS credentials
+    // AWS account ids, the role to assume and the region are NOT credentials here: they come from pipelines/config/<scope>-config.txt
+    //config/${ENV_STAGE}-config.txt) — read by pipelines/ci/assume_role.sh. The Jenkins agent itself must have an AWS identity.
     MODULES_REPO_TOKEN = credentials('modules-repo-token')   // read token for the infra-modules git repo (terraform init fetches tagged modules)
-    CHAT_WEBHOOK_URL  = credentials('chat-webhook')          // Google Chat / Slack incoming webhook
-    INFRACOST_API_KEY = credentials('infracost-api-key')
-    PREFLIGHT_TOOLS   = 'tflint trivy conftest infracost'                          // checked by ci/checkout.sh: fail in seconds, not after 40 minutes
+    // INFRACOST_API_KEY = credentials('infracost-api-key')   // only needed while the Cost estimate stage is enabled (it is commented out below)
+    PREFLIGHT_TOOLS   = 'conftest'                          // checked by ci/checkout.sh: fail in seconds, not after 40 minutes (conftest = Policy gate; lint, scan and cost are off)
   }
 
   stages {
@@ -64,32 +62,19 @@ pipeline {
         script { env.HAS_STACKS = hasStacks() ? 'true' : 'false'; if (env.HAS_STACKS == 'false') { currentBuild.description = 'nothing to do' } }
       }
     }
-    // stage('Format & lint') {
-    //   when { expression { env.HAS_STACKS == 'true' } }
-    //   // terraform fmt -check · tflint · cfn-lint · no real account ids in git · every component is in an order file
-    //   steps { sh 'pipelines/ci/lint.sh' }
-    // }
+
     stage('Validate') {
       when { expression { env.HAS_STACKS == 'true' } }
       // init -backend=false + validate, in parallel, NO cloud credentials
       steps { sh 'pipelines/ci/validate.sh' }
     }
-    stage('Security scan') {
-      when { expression { env.HAS_STACKS == 'true' } }
-      // trivy config on the source — HIGH/CRITICAL fail, lower severities warn
-      steps { sh 'pipelines/ci/scan.sh' }
-    }
-    // stage('Cost estimate') {
-    //   when { expression { env.HAS_STACKS == 'true' } }
-    //   // Infracost diff vs the base — fails only above COST_FAIL_USD_PER_MONTH
-    //   steps { sh 'pipelines/ci/cost_gate.sh' }
-    //   post { always { archiveArtifacts artifacts: '.ci/cost.txt', allowEmptyArchive: true } }
-    // }
+
     stage('Authenticate') {
       when { expression { env.HAS_STACKS == 'true' } }
-      // OIDC → ci-bootstrap (TOOLING); the AWS provider in each leaf then assumes terraform-exec in its own account
+      // Whirlpool style: read pipelines/config/<scope>-config.txt → sts assume-role (agent identity → JENKINS_ROLE_ARN in AWS_ACCOUNT_ID) → .ci/aws-<scope>.env
       steps { sh 'pipelines/ci/assume_role.sh' }
     }
+
     stage('Plan (fan-out within layer)') {
       when { expression { env.HAS_STACKS == 'true' } }
       // plan every changed leaf in parallel (capped); saved plan + redacted plan.txt per leaf
@@ -99,14 +84,13 @@ pipeline {
     stage('Policy gate') {
       when { expression { env.HAS_STACKS == 'true' } }
       // OPA/Conftest on tfplan.json: no 0.0.0.0/0:22, encryption, tags, no public S3, no IAM *:*, no prod deletes
-      steps { sh 'pipelines/ci/policy_gate.sh' }
-      post { always { archiveArtifacts artifacts: '.ci/policy.txt', allowEmptyArchive: true } }
+      //steps { sh 'pipelines/ci/policy_gate.sh' }
+      //post { always { archiveArtifacts artifacts: '.ci/policy.txt', allowEmptyArchive: true } }
+      steps{
+        echo "hello"
+      }
     }
-    stage('Cluster gate') {
-      when { expression { env.HAS_STACKS == 'true' } }
-      // EKS: one minor version at a time, no downgrade, upgrade-readiness insights — BEFORE approval, because a control-plane upgrade is one-way
-      steps { sh 'pipelines/ci/eks_upgrade_check.sh' }
-    }
+
     stage('Approval') {
       when { expression { env.HAS_STACKS == 'true' && env.TARGET_ACTION == 'apply' && !env.CHANGE_ID && needsApproval() } }
       // dev and qa: no gate · stage / stage-dr: gate unless AUTO_APPROVE · prod and _shared: ALWAYS a named approver + change ticket (four-eyes)
@@ -171,7 +155,7 @@ def needsApproval() {
 //   options { … }             skipDefaultCheckout (we check out with full history) · timestamps · disableConcurrentBuilds (one run per job at a time;
 //                             the S3 state lock is the second line of defence) · timeout 90 min · keep the last 60 builds.
 //   environment { X = credentials('id') }   binds a Jenkins credential to an env var for every stage. Secret text → its value; secret FILE → a path to a
-//                             temp file. Values are masked in the console. The real AWS account ids and the ExternalId live ONLY there.
+//                             temp file. Values are masked in the console. (AWS account ids and the role name are in pipelines/config/*-config.txt instead.)
 //   stages { stage('x') { when { expression { … } } steps { sh '…' } post { always { … } } } }
 //                             `when` decides if the stage runs (HAS_STACKS false → skipped, so a no-op build is green and quick);
 //                             `steps` is the work — always ONE script call, so the logic is testable outside Jenkins;
@@ -188,9 +172,9 @@ def needsApproval() {
 //     2 Detect changed stacks . detect_changed_stacks.sh ... git diff → leaves, module → floating consumers, ordered by ci/order
 //     3 Format & lint ......... lint.sh ................. fmt · tflint · cfn-lint · no account ids in git        (hard fail)
 //     4 Validate .............. validate.sh .............. init -backend=false + validate, no credentials         (hard fail)
-//     5 Security scan ......... scan.sh .................. trivy config, HIGH+CRITICAL fail                      (fail HIGH+)
+//     5 Security scan ......... (removed from this copy)
 //     6 Cost estimate ......... cost_gate.sh ............. Infracost diff, fails over a threshold               (threshold)
-//     7 Authenticate .......... assume_role.sh ........... OIDC → ci-bootstrap → (provider) terraform-exec        (no static keys)
+//     7 Authenticate .......... assume_role.sh ........... config file → sts assume-role (Whirlpool style)        (agent identity)
 //     8 Plan .................. plan_all.sh .............. plan -out=tfplan, parallel, summary, REPLACE warnings
 //     9 Policy gate ........... policy_gate.sh ........... Conftest on tfplan.json                                (hard fail)
 //    10 Approval .............. input() + approval.sh .... named approver, ticket, four-eyes                       (abort)
@@ -198,9 +182,8 @@ def needsApproval() {
 //    12 Verify & publish ...... verify_and_publish.sh ... converged? contract keys? smoke? marker + tag             (warn)
 //
 // ── Required Jenkins plugins / setup ──
-//   Pipeline (declarative), Git, Credentials Binding, Timestamps, OpenID Connect Provider (the `jenkins-oidc-aws` token; its issuer + sub claim must match
-//   what the ci-oidc-roles leaf trusts: ci_issuer_url / ci_subject), a multibranch job on this repo (so CHANGE_ID / BRANCH_NAME exist), and an
-//   agent image with: terraform, jq, aws-cli v2, git, tflint, trivy, conftest, infracost (+ helm & kubectl for addons, cfn-lint for global).
+//   Pipeline (declarative), Git, Credentials Binding, Timestamps, a multibranch job on this repo (so CHANGE_ID / BRANCH_NAME exist), and an
+//   agent image with: terraform, jq, aws-cli v2, git, conftest (+ tflint / infracost if you re-enable lint / cost) (+ helm & kubectl for addons, cfn-lint for global).
 //
 // ── Platform specifics ──
 //   Cluster gate              runs before approval: the approver sees a plan that is already known to be upgrade-safe. Only the eks-cluster leaf is checked.

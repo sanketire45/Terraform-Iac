@@ -1,0 +1,11 @@
+# Prometheus scrape configuration used by the managed scraper (aws_prometheus_scraper.eks)
+global:
+  scrape_interval: 30s
+scrape_configs:
+  - job_name: kubernetes-pods
+    kubernetes_sd_configs:
+      - role: pod
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        action: keep
+        regex: "true"
