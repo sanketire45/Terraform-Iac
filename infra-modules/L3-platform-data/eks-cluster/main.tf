@@ -106,7 +106,7 @@ resource "aws_eks_cluster" "this" {
   upgrade_policy { support_type = "STANDARD" } # avoid the extended-support surcharge
 
   depends_on = [aws_iam_role_policy_attachment.cluster] # role must have its policy BEFORE the cluster uses it
-  lifecycle { prevent_destroy = true }
+  lifecycle { prevent_destroy = false }
 }
 
 resource "aws_cloudwatch_log_group" "eks" { # create it yourself so you control retention (R64)

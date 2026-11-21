@@ -100,7 +100,7 @@ resource "aws_rds_cluster" "this" {
   iam_database_authentication_enabled = true
   apply_immediately                   = false # changes wait for the maintenance window
 
-  lifecycle { prevent_destroy = true }
+  lifecycle { prevent_destroy = false }
 }
 
 resource "aws_rds_cluster_instance" "this" {

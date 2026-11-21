@@ -10,7 +10,7 @@ pipeline {
   agent { label 'terraform' }     // ONE node for the whole run: plans stay on its disk between Plan and Apply (never a bare apply)
   parameters {
     choice(name: 'ENV',    choices: ['dev', 'qa', 'stage', 'prod', '_shared'], description: 'which environment folder (infra-live/L3-platform-data/<ENV>/…) — _shared = kms / ecr / private-ca — apply it BEFORE the environments')
-    choice(name: 'REGION', choices: ['eu-west-1'], description: 'region folder (state key + provider region)')
+    choice(name: 'REGION', choices: ['us-east-2'], description: 'region folder (state key + provider region)')
     string(name: 'COMPONENT', defaultValue: 'all', description: "one stack folder (or a,b,c), or 'all' = detect from git diff")
     choice(name: 'ACTION', choices: ['plan', 'apply'], description: 'plan = stages 1-9 only; apply = through 12')
     booleanParam(name: 'AUTO_APPROVE', defaultValue: false, description: 'skip the approval gate — honoured for stage / stage-dr ONLY; prod and _shared always need an approver')
@@ -46,7 +46,7 @@ pipeline {
           def byUser = currentBuild.getBuildCauses('hudson.model.Cause$UserIdCause')
           env.STARTED_BY    = byUser ? byUser[0].userId : 'scm'
           env.TARGET_ENV    = env.CHANGE_ID ? 'any' : (params.ENV ?: 'dev')
-          env.TARGET_REGION = env.CHANGE_ID ? 'any' : (params.REGION ?: 'eu-west-1')
+          env.TARGET_REGION = env.CHANGE_ID ? 'any' : (params.REGION ?: 'us-east-2')
           env.TARGET_ACTION = env.CHANGE_ID ? 'plan' : (params.ACTION ?: 'plan')
           env.ALL_STACKS    = "${params.ALL_STACKS ?: false}"
           if (!env.CHANGE_ID && env.BRANCH_NAME == 'main' && !byUser) { env.TARGET_ENV = 'dev'; env.TARGET_ACTION = 'apply' }

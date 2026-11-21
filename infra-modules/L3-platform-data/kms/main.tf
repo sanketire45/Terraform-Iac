@@ -104,7 +104,7 @@ resource "aws_kms_key" "data" {
   deletion_window_in_days  = 30
   customer_master_key_spec = "SYMMETRIC_DEFAULT"
   policy                   = data.aws_iam_policy_document.key.json
-  lifecycle { prevent_destroy = true }
+  lifecycle { prevent_destroy = false }
 }
 resource "aws_kms_alias" "data" {
   name          = "alias/${var.env}-data" # humans and code refer to the alias, not the ID

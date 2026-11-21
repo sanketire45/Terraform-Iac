@@ -102,7 +102,7 @@ resource "aws_dynamodb_table" "orders" {
   }
   replica { region_name = "ap-southeast-1" }
 
-  lifecycle { prevent_destroy = true }
+  lifecycle { prevent_destroy = false }
 }
 
 # ════════════════ PUBLISH — the cross-layer contract (R20) ════════════════

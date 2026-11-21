@@ -37,18 +37,21 @@ variable "region" {
 
 variable "kms_key_arn" {
   type        = string
-  description = "Kms key arn — read from the SSM contract (/<org>/<env>/security/kms_key_arn, published by kms)"
+  default     = ""
+  description = "Kms key arn from the SSM contract (/<org>/<env>/security/kms_key_arn). Empty = the queues use SQS-managed encryption (no KMS key)."
 }
 
 variable "kms_key_id" {
   type        = string
-  description = "Kms key id — read from the SSM contract (/<org>/<env>/security/kms_key_id, published by kms)"
+  default     = ""
+  description = "Kms key id from the SSM contract (/<org>/<env>/security/kms_key_id). Empty = the topic is not KMS-encrypted."
 }
 
 resource "aws_sqs_queue" "dlq" {
   name                      = "${var.env}-orders-dlq"
   message_retention_seconds = 1209600 # 14 days — time to investigate
-  kms_master_key_id         = var.kms_key_arn
+  kms_master_key_id         = var.kms_key_arn != "" ? var.kms_key_arn : null
+  sqs_managed_sse_enabled   = var.kms_key_arn == "" ? true : null
 }
 
 resource "aws_sqs_queue" "orders" {
@@ -56,7 +59,8 @@ resource "aws_sqs_queue" "orders" {
   visibility_timeout_seconds = 120 # ≥ 6× your consumer's processing time
   message_retention_seconds  = 345600
   receive_wait_time_seconds  = 20 # long polling: fewer empty receives, lower cost
-  kms_master_key_id          = var.kms_key_arn
+  kms_master_key_id          = var.kms_key_arn != "" ? var.kms_key_arn : null
+  sqs_managed_sse_enabled    = var.kms_key_arn == "" ? true : null
   redrive_policy = jsonencode({
     deadLetterTargetArn = aws_sqs_queue.dlq.arn
     maxReceiveCount     = 5 # after 5 failed receives → DLQ
@@ -72,7 +76,7 @@ resource "aws_sqs_queue_redrive_allow_policy" "dlq" { # only this queue may use 
 
 resource "aws_sns_topic" "events" {
   name              = "${var.env}-order-events"
-  kms_master_key_id = var.kms_key_id
+  kms_master_key_id = var.kms_key_id != "" ? var.kms_key_id : null
 }
 resource "aws_sns_topic_subscription" "to_orders" {
   topic_arn            = aws_sns_topic.events.arn

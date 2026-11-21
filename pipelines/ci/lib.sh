@@ -20,7 +20,7 @@ mkdir -p "$STATE_DIR" "$WORK"
 # ── build parameters (the Jenkinsfile's "Checkout" stage normalises them into TARGET_*) ──
 ORG="${ORG:-acme}"
 TARGET_ENV="${TARGET_ENV:-${ENV:-any}}"             # dev | qa | stage | stage-dr | prod | _shared | org | tooling | any
-TARGET_REGION="${TARGET_REGION:-${REGION:-any}}"    # eu-west-1 | _ (region-less org leaves) | any
+TARGET_REGION="${TARGET_REGION:-${REGION:-any}}"    # us-east-2 | _ (region-less org leaves) | any
 TARGET_ACTION="${TARGET_ACTION:-${ACTION:-plan}}"   # plan | apply
 COMPONENT="${COMPONENT:-all}"                       # one stack folder, or "all"
 PLAN_PARALLEL="${PLAN_PARALLEL:-4}"                 # cap: provider APIs throttle if every stack plans at once
@@ -33,7 +33,7 @@ warn() { log "WARN: $*"; }
 die()  { log "ERROR: $*"; exit 1; }
 need() { local b; for b in "$@"; do command -v "$b" >/dev/null 2>&1 || die "required tool missing on the agent: $b"; done; }
 
-# stack id: a path "L5-edge-app/dev/eu-west-1/acm" becomes a folder-safe name for .work/ and for result files
+# stack id: a path "L5-edge-app/dev/us-east-2/acm" becomes a folder-safe name for .work/ and for result files
 stack_id() { printf '%s' "$1" | sed 's|/|__|g'; }
 
 # ── layer → the pipeline's order file(s) ──
@@ -72,7 +72,7 @@ read_config() {                                                           # read
   [ -f "$2" ] || die "config file not found: ${2#$ROOT/}"
   grep -E "^$1=" "$2" | head -1 | cut -d= -f2- | tr -d '[:space:]"' || true
 }
-stack_scope() { printf '%s' "$1" | cut -d/ -f2; }                        # L3-platform-data/dev/eu-west-1/kms → dev
+stack_scope() { printf '%s' "$1" | cut -d/ -f2; }                        # L3-platform-data/dev/us-east-2/kms → dev
 
 # ── account aliases: git only ever holds DEV_ACCOUNT, PROD_ACCOUNT … ; the real ids come from the config files ──
 ALIASES="MGMT_ACCOUNT SECURITY_ACCOUNT LOGARCHIVE_ACCOUNT TOOLING_ACCOUNT NETWORK_ACCOUNT SHARED_ACCOUNT DEV_ACCOUNT QA_ACCOUNT STAGE_ACCOUNT PROD_ACCOUNT EMEA_ACCOUNT"
@@ -124,7 +124,7 @@ render_aliases() {
 git_auth() {
   [ -n "${MODULES_REPO_TOKEN:-}" ] || return 0
   export GIT_CONFIG_GLOBAL="$STATE_DIR/gitconfig"
-  git config --file "$GIT_CONFIG_GLOBAL" url."https://x-access-token:${MODULES_REPO_TOKEN}@git.example.com/".insteadOf "https://git.example.com/"
+  git config --file "$GIT_CONFIG_GLOBAL" url."https://x-access-token:${MODULES_REPO_TOKEN}@github.com/".insteadOf "https://github.com/"
   chmod 600 "$GIT_CONFIG_GLOBAL"
 }
 
@@ -155,7 +155,7 @@ make_workdir() {
   cp -R "$live/$stack/." "$wd/"
   rel="${wd#$ROOT/}"; prefix="$(printf '%s' "$rel" | awk -F/ '{ s = ""; for (i = 1; i <= NF; i++) s = s "../"; print s }')"
   find "$wd" -name '*.tf' -print0 | xargs -0 sed -i.bak -E \
-    "s#git::https://git\.example\.com/infra-modules\.git//([A-Za-z0-9_./-]+)\?ref=$refpat#${prefix}${mods#$ROOT/}/\1#g"
+    "s#git::https://github\.com/sanketire45/Terraform-Iac\.git//infra-modules/([A-Za-z0-9_./-]+)\?ref=$refpat#${prefix}${mods#$ROOT/}/\1#g"
   find "$wd" -name '*.bak' -type f -delete
   printf '%s' "$wd"
 }

@@ -5,7 +5,7 @@
 # JENKINS_ROLE_ARN   the role NAME to assume inside that account (Whirlpool calls it JENKINS_ROLE_ARN too, though it is a name)
 # AWS_REGION         default region for the session
 # SHARED_ACCOUNT_ID  the account that holds the Terraform state bucket (the leaves call it TOOLING_ACCOUNT)
-AWS_ACCOUNT_ID=REPLACE_WITH_12_DIGIT_ACCOUNT_ID
+AWS_ACCOUNT_ID=656022989575
 JENKINS_ROLE_ARN=terraform-exec
-AWS_REGION=eu-west-1
-SHARED_ACCOUNT_ID=REPLACE_WITH_12_DIGIT_STATE_ACCOUNT_ID
+AWS_REGION=us-east-2
+SHARED_ACCOUNT_ID=656022989575

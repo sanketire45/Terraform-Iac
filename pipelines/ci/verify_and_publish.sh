@@ -34,14 +34,14 @@ done < "$applied"
 # 2 ── contract keys exist where the module says it publishes them
 while IFS= read -r s; do
   [ -n "$s" ] || continue
-  mod="$( { grep -hoE '//[A-Za-z0-9_-]+/[A-Za-z0-9_-]+\?ref=' "$LIVE/$s/main.tf" || true; } | head -1 | sed -E 's#^//##; s#\?ref=$##')"
+  mod="$( { grep -hoE 'infra-modules/[A-Za-z0-9_-]+/[A-Za-z0-9_-]+\?ref=' "$LIVE/$s/main.tf" || true; } | head -1 | sed -E 's#^infra-modules/##; s#\?ref=$##')"
   [ -n "$mod" ] && [ -f "$MODS/$mod/main.tf" ] || continue
   tpl="$( { grep -hoE 'ssm_prefix *= *"[^"]+"' "$MODS/$mod/main.tf" || true; } | head -1 | sed -E 's/.*= *"//; s/"$//')"
   [ -n "$tpl" ] || continue                                   # this module publishes nothing
   scope="$(printf '%s' "$s" | cut -d/ -f2)"; region="$(printf '%s' "$s" | cut -d/ -f3)"
   case "$scope" in _shared) envname=shared ;; *) envname="$scope" ;; esac
   prefix="$(printf '%s' "$tpl" | sed "s#\${var.org}#$ORG#g; s#\${var.env}#$envname#g")"
-  n="$( ( eval "$(exec_env "$s")"; aws ssm get-parameters-by-path --path "$prefix" --recursive --region "${region/_/eu-west-1}" --query 'length(Parameters)' --output text ) 2>/dev/null || echo 0)"
+  n="$( ( eval "$(exec_env "$s")"; aws ssm get-parameters-by-path --path "$prefix" --recursive --region "${region/_/us-east-2}" --query 'length(Parameters)' --output text ) 2>/dev/null || echo 0)"
   if [ "${n:-0}" -ge 1 ] 2>/dev/null; then log "contract ok: $prefix ($n keys)"; else flag "no SSM keys under $prefix after applying $s — downstream layers will fail"; fi
 done < "$applied"
 
@@ -76,7 +76,7 @@ now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 cut -d/ -f1-2 "$applied" | sort -u | while IFS= read -r ls_; do
   L="${ls_%%/*}"; scope="${ls_#*/}"
   first="$(grep -m1 "^$ls_/" "$applied")"
-  region="$(printf '%s' "$first" | cut -d/ -f3)"; [ "$region" = _ ] && region=eu-west-1
+  region="$(printf '%s' "$first" | cut -d/ -f3)"; [ "$region" = _ ] && region=us-east-2
   case "$scope" in _shared) envname=shared ;; *) envname="$scope" ;; esac
   ( eval "$(exec_env "$first")"
     aws ssm put-parameter --name "/$ORG/$envname/ops/last_apply/$layer_name" --type String --overwrite --region "$region" \

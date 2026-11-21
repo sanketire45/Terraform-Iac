@@ -7,7 +7,7 @@ iam-roles
 s3
 ecr
 private-ca
-rds-aurora | dynamodb | msk | efs | messaging-sqs-sns | aurora-global   # data tier: independent of each other
+rds-aurora | dynamodb | msk | efs | messaging-sqs-sns | aurora-global | rds-mysql   # data tier: independent of each other
 eks-cluster
 eks-irsa             # needs the cluster's OIDC issuer — NEVER before eks-cluster
 eks-nodes

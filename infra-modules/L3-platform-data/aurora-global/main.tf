@@ -43,7 +43,7 @@ variable "euw1_kms_key_arn" {
 
 variable "euw1_subnet_group" {
   type        = string
-  description = "DB subnet group in the primary region (eu-west-1)"
+  description = "DB subnet group in the primary region (us-east-2)"
 }
 
 variable "use1_kms_key_arn" {
@@ -64,7 +64,7 @@ resource "aws_rds_global_cluster" "this" {
   deletion_protection       = true
 }
 
-# PRIMARY (eu-west-1)
+# PRIMARY (us-east-2)
 resource "aws_rds_cluster" "primary" {
   provider                    = aws.euw1
   cluster_identifier          = "orders-euw1"

@@ -5,7 +5,7 @@
 #  ci/order/*.order file. Nothing to do → writes an empty list and exits GREEN (the Jenkinsfile then skips the rest).
 #
 #  Inputs (env): TARGET_ENV   dev|qa|stage|stage-dr|prod|_shared|org|tooling|any      (any = no environment filter)
-#                TARGET_REGION eu-west-1 | _ | any
+#                TARGET_REGION us-east-2 | _ | any
 #                COMPONENT    "all" or a comma list of component folders (explicit request: ignores the git diff)
 #                ALL_STACKS   true = every leaf in scope, ignore the diff (re-run / first deploy / after an outage)
 #                BASE_SHA     override the diff base;  CHANGE_ID / CHANGE_TARGET  set by Jenkins on PR builds
@@ -50,7 +50,7 @@ resolve_base() {
 }
 
 consumers() {   # consumers <layer/module> → leaves of this layer that float on it
-  grep -rlF --include=main.tf "infra-modules.git//$1?ref=main" "$LIVE/$layer" 2>/dev/null \
+  grep -rlF --include=main.tf "Terraform-Iac.git//infra-modules/$1?ref=main" "$LIVE/$layer" 2>/dev/null \
     | sed "s|^$LIVE/||; s|/main.tf$||" || true
 }
 
@@ -79,7 +79,7 @@ else
         infra-modules/"$layer"/*/*)
           m="$(printf '%s' "$f" | cut -d/ -f2-3)"
           consumers "$m" >> "$tmp/cand.txt"
-          pinned="$( { grep -rlE --include=main.tf "infra-modules\.git//$m\?ref=v" "$LIVE/$layer" 2>/dev/null || true; } | wc -l | tr -d ' ')"
+          pinned="$( { grep -rlE --include=main.tf "Terraform-Iac\.git//infra-modules/$m\?ref=v" "$LIVE/$layer" 2>/dev/null || true; } | wc -l | tr -d ' ')"
           [ "$pinned" = 0 ] || log "module $m changed: $pinned leaf(s) pin a release tag and are NOT affected until their ?ref is bumped" ;;
         policy/*|pipelines/*)
           [ -n "${widened:-}" ] || log "$f changed (policy/pipeline code) → every leaf in scope is re-tested"; widened=1

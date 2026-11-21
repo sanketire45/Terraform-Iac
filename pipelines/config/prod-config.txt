@@ -7,5 +7,5 @@
 # SHARED_ACCOUNT_ID  the account that holds the Terraform state bucket (the leaves call it TOOLING_ACCOUNT)
 AWS_ACCOUNT_ID=REPLACE_WITH_12_DIGIT_ACCOUNT_ID
 JENKINS_ROLE_ARN=terraform-exec
-AWS_REGION=eu-west-1
+AWS_REGION=us-east-2
 SHARED_ACCOUNT_ID=REPLACE_WITH_12_DIGIT_STATE_ACCOUNT_ID

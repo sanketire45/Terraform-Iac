@@ -9,7 +9,7 @@ pipeline {
     )
     choice(
       name: 'REGION',
-      choices: ['eu-west-1'],
+      choices: ['us-east-2'],
       description: 'Region folder (state key + provider region).'
     )
     string(
@@ -19,13 +19,13 @@ pipeline {
     )
     choice(
       name: 'ACTION',
-      choices: ['plan', 'apply'],
-      description: 'plan = plan only; apply = plan, approval, apply, verify.'
+      choices: ['plan', 'apply', 'destroy'],
+      description: 'plan = plan only; apply = plan, approval, apply, verify; destroy = destroy plan, approval, destroy in reverse order (needs COMPONENT or ALL_STACKS).'
     )
     booleanParam(
       name: 'AUTO_APPROVE',
       defaultValue: false,
-      description: 'Skip the approval gate. Honoured for stage only; prod and _shared always need an approver.'
+      description: 'Skip the approval gate. Honoured for stage only; prod, _shared and every destroy always need an approver.'
     )
     booleanParam(
       name: 'ALL_STACKS',
@@ -38,7 +38,7 @@ pipeline {
     skipDefaultCheckout(true)
     timestamps()
     disableConcurrentBuilds()
-    timeout(time: 90, unit: 'MINUTES')
+    timeout(time: 5, unit: 'HOURS')
     buildDiscarder(logRotator(numToKeepStr: '60'))
   }
 
@@ -48,10 +48,6 @@ pipeline {
     IAC_DIR            = '.'
     LOCAL_MODULES_ALL  = 'true'
     PREFLIGHT_TOOLS    = ''
-    AWS_ACCOUNT_ID     = ''
-    JENKINS_ROLE_ARN   = ''
-    AWS_REGION         = ''
-    SHARED_ACCOUNT_ID  = ''
   }
 
   stages {
@@ -73,13 +69,17 @@ pipeline {
 
           env.STARTED_BY    = byUser ? byUser[0].userId : 'scm'
           env.TARGET_ENV    = env.CHANGE_ID ? 'any'  : (params.ENV ?: 'dev')
-          env.TARGET_REGION = env.CHANGE_ID ? 'any'  : (params.REGION ?: 'eu-west-1')
+          env.TARGET_REGION = env.CHANGE_ID ? 'any'  : (params.REGION ?: 'us-east-2')
           env.TARGET_ACTION = env.CHANGE_ID ? 'plan' : (params.ACTION ?: 'plan')
           env.ALL_STACKS    = "${params.ALL_STACKS ?: false}"
 
           if (!env.CHANGE_ID && env.BRANCH_NAME == 'main' && !byUser) {
             env.TARGET_ENV    = 'dev'
             env.TARGET_ACTION = 'apply'
+          }
+
+          if (env.TARGET_ACTION == 'destroy' && params.COMPONENT == 'all' && !params.ALL_STACKS) {
+            error("ACTION=destroy needs COMPONENT=<leaf names> (or tick ALL_STACKS). It never works from the git diff.")
           }
 
           currentBuild.displayName = "#${env.BUILD_NUMBER} ${env.TARGET_ENV}/${env.LAYER} ${env.TARGET_ACTION}"
@@ -168,7 +168,7 @@ pipeline {
             }
 
             consumers() {
-              grep -rlF --include=main.tf "infra-modules.git//$1?ref=main" "$LIVE/$layer" 2>/dev/null \\
+              grep -rlF --include=main.tf "Terraform-Iac.git//infra-modules/$1?ref=main" "$LIVE/$layer" 2>/dev/null \\
                 | sed "s|^$LIVE/||; s|/main.tf$||" || true
             }
 
@@ -197,7 +197,7 @@ pipeline {
                     infra-modules/"$layer"/*/*)
                       m="$(printf '%s' "$f" | cut -d/ -f2-3)"
                       consumers "$m" >> "$tmp/cand.txt"
-                      pinned="$( { grep -rlE --include=main.tf "infra-modules\\.git//$m\\?ref=v" "$LIVE/$layer" 2>/dev/null || true; } | wc -l | tr -d ' ')"
+                      pinned="$( { grep -rlE --include=main.tf "Terraform-Iac\\.git//infra-modules/$m\\?ref=v" "$LIVE/$layer" 2>/dev/null || true; } | wc -l | tr -d ' ')"
                       [ "$pinned" = 0 ] || log "module $m changed: $pinned leaf(s) pin a release tag and are NOT affected until their ?ref is bumped" ;;
                     policy/*|pipelines/*)
                       [ -n "${widened:-}" ] || log "$f changed (policy/pipeline code) → every leaf in scope is re-tested"; widened=1
@@ -333,6 +333,8 @@ pipeline {
 
             plan_one() {
               stack="$1"; id="$(stack_id "$stack")"
+              destroy_flag=""
+              if [ "${TARGET_ACTION:-}" = destroy ]; then destroy_flag="-destroy"; fi
               mkdir -p "$STATE_DIR/results"
               wd="$(make_workdir "$stack")"
               rm -f "$wd/plan.rc"
@@ -342,7 +344,7 @@ pipeline {
                 render_aliases "$wd" real
                 terraform init "${TF_INIT_ARGS[@]}"                || { echo 1 > plan.rc; exit 0; }
                 render_aliases "$wd" real
-                terraform plan -input=false -no-color -lock-timeout=5m -detailed-exitcode -out=tfplan
+                terraform plan $destroy_flag -input=false -no-color -lock-timeout=5m -detailed-exitcode -out=tfplan
                 echo $? > plan.rc
               ) 2>&1 | sed "s|^|[$id] |" | tee "$wd/plan.log"
               rc="$(cat "$wd/plan.rc" 2>/dev/null || echo 1)"
@@ -419,15 +421,15 @@ pipeline {
     stage('Approval') {
       when {
         expression {
-          env.HAS_STACKS == 'true' && env.TARGET_ACTION == 'apply' && !env.CHANGE_ID && needsApproval()
+          env.HAS_STACKS == 'true' && env.TARGET_ACTION in ['apply', 'destroy'] && !env.CHANGE_ID && needsApproval()
         }
       }
       steps {
         script {
           timeout(time: 4, unit: 'HOURS') {
             def r = input(
-              message: "Apply ${env.LAYER} to ${env.TARGET_ENV}/${env.TARGET_REGION}?  Plan: ${env.BUILD_URL}artifact/${pfx()}.ci/plan_summary.txt",
-              ok: 'Approve apply',
+              message: "${env.TARGET_ACTION.toUpperCase()} ${env.LAYER} in ${env.TARGET_ENV}/${env.TARGET_REGION}?  Plan: ${env.BUILD_URL}artifact/${pfx()}.ci/plan_summary.txt",
+              ok: "Approve ${env.TARGET_ACTION}",
               submitter: (env.TARGET_ENV in ['prod', '_shared']) ? 'prod-approvers' : 'platform-approvers',
               submitterParameter: 'APPROVER',
               parameters: [
@@ -470,7 +472,7 @@ pipeline {
 
     stage('Apply saved plan (ordered)') {
       when {
-        expression { env.HAS_STACKS == 'true' && env.TARGET_ACTION == 'apply' && !env.CHANGE_ID }
+        expression { env.HAS_STACKS == 'true' && env.TARGET_ACTION in ['apply', 'destroy'] && !env.CHANGE_ID }
       }
       steps {
         script {
@@ -490,7 +492,9 @@ pipeline {
             order=platform
             [ -f "$CI_DIR/order/$order.order" ] || die "no such order file: ci/order/$order.order"
             [ -s "$APPLY_FILE" ] || { log "no stack has changes — nothing to apply"; exit 0; }
-            [ "$TARGET_ACTION" = apply ] || die "refusing to apply: ACTION is '$TARGET_ACTION'"
+            case "$TARGET_ACTION" in apply|destroy) ;; *) die "refusing to run: ACTION is '$TARGET_ACTION'" ;; esac
+            rank_sort="-nu"
+            if [ "$TARGET_ACTION" = destroy ]; then rank_sort="-nru"; fi
             git_auth
 
             queue="$STATE_DIR/apply_queue_$order.txt"; : > "$queue"
@@ -503,9 +507,9 @@ pipeline {
             sort -t "$(printf '\\t')" -k1,1n -k2,2 "$queue" -o "$queue"
 
             done_list="$STATE_DIR/applied_stacks.txt"; touch "$done_list"
-            for r in $(cut -f1 "$queue" | sort -nu); do
+            for r in $(cut -f1 "$queue" | sort $rank_sort); do
               group="$(awk -F'\\t' -v r="$r" '$1 == r { print $2 }' "$queue")"
-              log "── apply group (rank $r): $(printf '%s' "$group" | tr '\\n' ' ')"
+              log "── $TARGET_ACTION group (rank $r): $(printf '%s' "$group" | tr '\\n' ' ')"
               if ! printf '%s\\n' "$group" | xargs -P "$PLAN_PARALLEL" -I{} bash -c '. .ci/lib.sh; apply_one "$1"' _ {}; then
                 log "applied so far:"; sed 's/^/    ✔ /' "$done_list" >&2
                 log "still pending:"; awk -F'\\t' -v r="$r" '$1 >= r { print "    … " $2 }' "$queue" >&2
@@ -513,7 +517,7 @@ pipeline {
               fi
               printf '%s\\n' "$group" >> "$done_list"
             done
-            log "apply OK ($order): $(grep -c . "$queue") stack(s)"
+            log "$TARGET_ACTION OK ($order): $(grep -c . "$queue") stack(s)"
           '''.stripIndent())
         }
       }
@@ -548,14 +552,14 @@ pipeline {
 
             while IFS= read -r s; do
               [ -n "$s" ] || continue
-              mod="$( { grep -hoE '//[A-Za-z0-9_-]+/[A-Za-z0-9_-]+\\?ref=' "$LIVE/$s/main.tf" || true; } | head -1 | sed -E 's#^//##; s#\\?ref=$##')"
+              mod="$( { grep -hoE 'infra-modules/[A-Za-z0-9_-]+/[A-Za-z0-9_-]+\\?ref=' "$LIVE/$s/main.tf" || true; } | head -1 | sed -E 's#^infra-modules/##; s#\\?ref=$##')"
               [ -n "$mod" ] && [ -f "$MODS/$mod/main.tf" ] || continue
               tpl="$( { grep -hoE 'ssm_prefix *= *"[^"]+"' "$MODS/$mod/main.tf" || true; } | head -1 | sed -E 's/.*= *"//; s/"$//')"
               [ -n "$tpl" ] || continue
               scope="$(printf '%s' "$s" | cut -d/ -f2)"; region="$(printf '%s' "$s" | cut -d/ -f3)"
               case "$scope" in _shared) envname=shared ;; *) envname="$scope" ;; esac
               prefix="$(printf '%s' "$tpl" | sed "s#\\${var.org}#$ORG#g; s#\\${var.env}#$envname#g")"
-              n="$( ( eval "$(exec_env "$s")"; aws ssm get-parameters-by-path --path "$prefix" --recursive --region "${region/_/eu-west-1}" --query 'length(Parameters)' --output text ) 2>/dev/null || echo 0)"
+              n="$( ( eval "$(exec_env "$s")"; aws ssm get-parameters-by-path --path "$prefix" --recursive --region "${region/_/us-east-2}" --query 'length(Parameters)' --output text ) 2>/dev/null || echo 0)"
               if [ "${n:-0}" -ge 1 ] 2>/dev/null; then log "contract ok: $prefix ($n keys)"; else flag "no SSM keys under $prefix after applying $s — downstream layers will fail"; fi
             done < "$applied"
 
@@ -573,7 +577,7 @@ pipeline {
             cut -d/ -f1-2 "$applied" | sort -u | while IFS= read -r ls_; do
               L="${ls_%%/*}"; scope="${ls_#*/}"
               first="$(grep -m1 "^$ls_/" "$applied")"
-              region="$(printf '%s' "$first" | cut -d/ -f3)"; [ "$region" = _ ] && region=eu-west-1
+              region="$(printf '%s' "$first" | cut -d/ -f3)"; [ "$region" = _ ] && region=us-east-2
               case "$scope" in _shared) envname=shared ;; *) envname="$scope" ;; esac
               ( eval "$(exec_env "$first")"
                 aws ssm put-parameter --name "/$ORG/$envname/ops/last_apply/$layer_name" --type String --overwrite --region "$region" \\
@@ -681,6 +685,7 @@ def readConfigParameter(String key, String file) {
 }
 
 def needsApproval() {
+  if (env.TARGET_ACTION == 'destroy')                { return true }
   if (env.TARGET_ACTION != 'apply')                  { return false }
   if (env.TARGET_ENV in ['prod', '_shared'])         { return true }
   if (env.TARGET_ENV in ['stage', 'stage-dr'])       { return !params.AUTO_APPROVE }
@@ -787,7 +792,7 @@ def libSh() {
     git_auth() {
       [ -n "${MODULES_REPO_TOKEN:-}" ] || return 0
       export GIT_CONFIG_GLOBAL="$STATE_DIR/gitconfig"
-      git config --file "$GIT_CONFIG_GLOBAL" url."https://x-access-token:${MODULES_REPO_TOKEN}@git.example.com/".insteadOf "https://git.example.com/"
+      git config --file "$GIT_CONFIG_GLOBAL" url."https://x-access-token:${MODULES_REPO_TOKEN}@github.com/".insteadOf "https://github.com/"
       chmod 600 "$GIT_CONFIG_GLOBAL"
     }
 
@@ -802,7 +807,7 @@ def libSh() {
       cp -R "$live/$stack/." "$wd/"
       rel="${wd#$ROOT/}"; prefix="$(printf '%s' "$rel" | awk -F/ '{ s = ""; for (i = 1; i <= NF; i++) s = s "../"; print s }')"
       find "$wd" -name '*.tf' -print0 | xargs -0 sed -i.bak -E \\
-        "s#git::https://git\\.example\\.com/infra-modules\\.git//([A-Za-z0-9_./-]+)\\?ref=$refpat#${prefix}${mods#$ROOT/}/\\1#g"
+        "s#git::https://github\\.com/sanketire45/Terraform-Iac\\.git//infra-modules/([A-Za-z0-9_./-]+)\\?ref=$refpat#${prefix}${mods#$ROOT/}/\\1#g"
       find "$wd" -name '*.bak' -type f -delete
       printf '%s' "$wd"
     }

@@ -29,7 +29,7 @@ log "Jenkins agent identity: $(printf '%s' "$me" | sed -E 's#:[0-9]{12}:#:<accou
 
 session="$(printf 'jenkins-%s' "${BUILD_TAG:-manual}" | tr -c 'A-Za-z0-9+=,.@_-' '-' | cut -c1-64)"   # shows up in CloudTrail
 
-# 1. which environments (scopes) do the changed stacks belong to?   L3-platform-data/<dev>/eu-west-1/kms → dev
+# 1. which environments (scopes) do the changed stacks belong to?   L3-platform-data/<dev>/us-east-2/kms → dev
 if [ -s "$CHANGED_FILE" ]; then scopes="$(cut -d/ -f2 "$CHANGED_FILE" | sort -u)"; else scopes="${TARGET_ENV:?}"; fi
 
 # 2. for each scope: read its config file, assume the role in that account, save the session

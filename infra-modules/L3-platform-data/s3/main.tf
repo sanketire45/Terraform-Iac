@@ -62,7 +62,7 @@ variable "role_replication_arn" {
 
 resource "aws_s3_bucket" "data" {
   bucket = "${var.org}-${var.env}-${var.purpose}"
-  lifecycle { prevent_destroy = true }
+  lifecycle { prevent_destroy = false }
 }
 
 resource "aws_s3_bucket_versioning" "data" {

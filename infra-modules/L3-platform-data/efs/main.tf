@@ -58,7 +58,7 @@ resource "aws_efs_file_system" "this" {
   throughput_mode  = "elastic" # scales with demand; or "provisioned"
   lifecycle_policy { transition_to_ia = "AFTER_30_DAYS" }
   lifecycle_policy { transition_to_primary_storage_class = "AFTER_1_ACCESS" }
-  lifecycle { prevent_destroy = true }
+  lifecycle { prevent_destroy = false }
 }
 
 resource "aws_efs_mount_target" "this" {
