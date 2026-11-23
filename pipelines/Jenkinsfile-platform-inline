@@ -13,7 +13,7 @@ pipeline {
       description: 'Which region subfolder to act on.'
     )
     string(
-      name: 'STACKS',
+      name: 'STACKS_TO_DEPLOY',
       defaultValue: 'auto',
       description: "WHICH stack folders to touch. Comma-separated list, e.g. 'kms,rds-mysql' = exactly these. 'auto' = detect from the git diff (empty on a clean build). Ignored when DEPLOY_ALL is ticked."
     )
@@ -30,7 +30,7 @@ pipeline {
     booleanParam(
       name: 'DEPLOY_ALL',
       defaultValue: false,
-      description: 'Override STACKS and act on EVERY stack of this ENV/REGION. Use for the very first deploy or a rebuild after an outage. When unticked, STACKS decides.'
+      description: 'Override STACKS_TO_DEPLOY and act on EVERY stack of this ENV/REGION. Use for the very first deploy or a rebuild after an outage. When unticked, STACKS_TO_DEPLOY decides.'
     )
   }
 
@@ -61,8 +61,8 @@ pipeline {
           extensions: [[$class: 'CloneOption', noTags: false, shallow: false]]
         ])
         script {
-          if (!(params.STACKS ==~ /^[a-z0-9_,-]+$/)) {
-            error("STACKS '${params.STACKS}' is not a valid stack folder list")
+          if (!(params.STACKS_TO_DEPLOY ==~ /^[a-z0-9_,-]+$/)) {
+            error("STACKS '${params.STACKS_TO_DEPLOY}' is not a valid stack folder list")
           }
 
           def byUser = currentBuild.getBuildCauses('hudson.model.Cause$UserIdCause')
@@ -78,8 +78,8 @@ pipeline {
             env.TARGET_ACTION = 'apply'
           }
 
-          if (env.TARGET_ACTION == 'destroy' && params.STACKS == 'auto' && !params.DEPLOY_ALL) {
-            error("ACTION=destroy needs STACKS=<leaf names> (or tick DEPLOY_ALL). It never works from the git diff.")
+          if (env.TARGET_ACTION == 'destroy' && params.STACKS_TO_DEPLOY == 'auto' && !params.DEPLOY_ALL) {
+            error("ACTION=destroy needs STACKS_TO_DEPLOY=<leaf names> (or tick DEPLOY_ALL). It never works from the git diff.")
           }
 
           currentBuild.displayName = "#${env.BUILD_NUMBER} ${env.TARGET_ENV}/${env.LAYER} ${env.TARGET_ACTION}"
@@ -172,9 +172,9 @@ pipeline {
                 | sed "s|^$LIVE/||; s|/main.tf$||" || true
             }
 
-            if [ "$STACKS" != auto ]; then
-              log "explicit STACKS=$STACKS (the git diff is ignored)"
-              for c in $(printf '%s' "$STACKS" | tr ',' ' '); do
+            if [ "$STACKS_TO_DEPLOY" != auto ]; then
+              log "explicit STACKS_TO_DEPLOY=$STACKS_TO_DEPLOY (the git diff is ignored)"
+              for c in $(printf '%s' "$STACKS_TO_DEPLOY" | tr ',' ' '); do
                 n0="$(wc -l < "$tmp/cand.txt" | tr -d ' ')"
                 awk -F/ -v c="$c" '$NF == c' "$tmp/scope.txt" >> "$tmp/cand.txt"
                 [ "$(wc -l < "$tmp/cand.txt" | tr -d ' ')" -gt "$n0" ] || die "component '$c' has no leaf in $layer for env=$TARGET_ENV region=$TARGET_REGION"
@@ -458,7 +458,7 @@ pipeline {
                 [ -z "$STARTED_BY" ] || [ "$APPROVER" != "$STARTED_BY" ] || die "four-eyes rule: '$APPROVER' started this $TARGET_ENV build and cannot approve it" ;;
             esac
 
-            jq -n --arg env "$TARGET_ENV" --arg region "$TARGET_REGION" --arg action "$TARGET_ACTION" --arg component "$STACKS" \\
+            jq -n --arg env "$TARGET_ENV" --arg region "$TARGET_REGION" --arg action "$TARGET_ACTION" --arg component "$STACKS_TO_DEPLOY" \\
                   --arg approver "$APPROVER" --arg started "$STARTED_BY" --arg ticket "$CHANGE_TICKET" \\
                   --arg build "${BUILD_TAG:-manual}" --arg sha "$(cat "$STATE_DIR/git_sha" 2>/dev/null || echo unknown)" \\
                   --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \\
@@ -710,7 +710,7 @@ def libSh() {
     TARGET_ENV="${TARGET_ENV:-${ENV:-any}}"
     TARGET_REGION="${TARGET_REGION:-${REGION:-any}}"
     TARGET_ACTION="${TARGET_ACTION:-${ACTION:-plan}}"
-    STACKS="${STACKS:-auto}"
+    STACKS_TO_DEPLOY="${STACKS_TO_DEPLOY:-auto}"
     PLAN_PARALLEL="${PLAN_PARALLEL:-4}"
     CHANGED_FILE="$STATE_DIR/changed_stacks.txt"
     APPLY_FILE="$STATE_DIR/apply_stacks.txt"
