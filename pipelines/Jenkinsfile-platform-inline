@@ -430,7 +430,7 @@ pipeline {
             def r = input(
               message: "${env.TARGET_ACTION.toUpperCase()} ${env.LAYER} in ${env.TARGET_ENV}/${env.TARGET_REGION}?  Plan: ${env.BUILD_URL}artifact/${pfx()}.ci/plan_summary.txt",
               ok: "Approve ${env.TARGET_ACTION}",
-              submitter: (env.TARGET_ENV in ['prod', '_shared']) ? 'prod-approvers' : 'platform-approvers',
+              submitter: 'admin',
               submitterParameter: 'APPROVER',
               parameters: [
                 string(name: 'CHANGE_TICKET', defaultValue: '', description: 'change request, e.g. CHG-12345 (mandatory for stage/prod)')
@@ -688,8 +688,7 @@ def needsApproval() {
   if (env.TARGET_ACTION == 'destroy')                { return true }
   if (env.TARGET_ACTION != 'apply')                  { return false }
   if (env.TARGET_ENV in ['prod', '_shared'])         { return true }
-  if (env.TARGET_ENV in ['stage', 'stage-dr'])       { return !params.AUTO_APPROVE }
-  return false
+  return !params.AUTO_APPROVE
 }
 
 
