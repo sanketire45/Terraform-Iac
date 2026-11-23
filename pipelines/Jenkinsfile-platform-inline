@@ -12,10 +12,29 @@ pipeline {
       choices: ['us-east-2'],
       description: 'Which region subfolder to act on.'
     )
-    string(
+    choice(
       name: 'STACKS_TO_DEPLOY',
-      defaultValue: 'auto',
-      description: "WHICH stack folders to touch. Comma-separated list, e.g. 'kms,rds-mysql' = exactly these. 'auto' = detect from the git diff (empty on a clean build). Ignored when DEPLOY_ALL is ticked."
+      choices: [
+        'auto',
+        'messaging-sqs-sns,rds-mysql',
+        'messaging-sqs-sns',
+        'rds-mysql',
+        'kms',
+        'secrets',
+        'ssm-contract',
+        'iam-roles',
+        's3',
+        'dynamodb',
+        'efs',
+        'rds-aurora',
+        'eks-cluster',
+        'eks-irsa',
+        'eks-nodes',
+        'eks-managed-addons',
+        'backup',
+        'observability-alarms'
+      ],
+      description: "WHICH stack folders to touch. Pick one, or a preset combination (e.g. 'messaging-sqs-sns,rds-mysql'). 'auto' = detect from the git diff. Ignored when DEPLOY_ALL is ticked."
     )
     choice(
       name: 'ACTION',
