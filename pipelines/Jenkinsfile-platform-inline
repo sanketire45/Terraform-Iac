@@ -25,7 +25,7 @@ pipeline {
     booleanParam(
       name: 'AUTO_APPROVE',
       defaultValue: false,
-      description: 'apply only: skip the human approval step. Honoured on stage. prod, _shared and every destroy always need approval.'
+      description: 'apply only: skip the approval step. Honoured on stage. prod, _shared and every destroy always need approval.'
     )
     booleanParam(
       name: 'DEPLOY_ALL',
