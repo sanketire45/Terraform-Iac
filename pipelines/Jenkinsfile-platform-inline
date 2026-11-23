@@ -20,7 +20,7 @@ pipeline {
     choice(
       name: 'ACTION',
       choices: ['plan', 'apply', 'destroy'],
-      description: 'WHAT to do. plan = plan only, no change. apply = plan + approval + apply + verify. destroy = reverse-order destroy (approval always required; STACKS or DEPLOY_ALL must name what to destroy).'
+      description: 'WHAT to do. plan = plan only, no change. apply = plan + approval + apply + verify. destroy = reverse-order destroy (approval always required; STACKS_TO_DEPLOY or DEPLOY_ALL must name what to destroy).'
     )
     booleanParam(
       name: 'AUTO_APPROVE',
@@ -62,7 +62,7 @@ pipeline {
         ])
         script {
           if (!(params.STACKS_TO_DEPLOY ==~ /^[a-z0-9_,-]+$/)) {
-            error("STACKS '${params.STACKS_TO_DEPLOY}' is not a valid stack folder list")
+            error("STACKS_TO_DEPLOY '${params.STACKS_TO_DEPLOY}' is not a valid stack folder list")
           }
 
           def byUser = currentBuild.getBuildCauses('hudson.model.Cause$UserIdCause')
