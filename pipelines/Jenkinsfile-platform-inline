@@ -351,13 +351,8 @@ pipeline {
               add=0; chg=0; del=0; rep=0
               if [ "$rc" = 0 ] || [ "$rc" = 2 ]; then
                 ( cd "$wd" && terraform show -no-color tfplan > plan.txt && terraform show -json tfplan > tfplan.json )
-                read -r add chg del rep <<EOF
-            $(jq -r '[.resource_changes[]? | select((.change.actions | index("no-op") | not) and (.change.actions | index("read") | not))] as $c
-                     | [ ($c | map(select(.change.actions == ["create"])) | length),
-                         ($c | map(select(.change.actions == ["update"])) | length),
-                         ($c | map(select(.change.actions == ["delete"])) | length),
-                         ($c | map(select((.change.actions | index("delete")) and (.change.actions | index("create")))) | length) ] | @tsv' "$wd/tfplan.json")
-            EOF
+                stats="$(jq -r '[.resource_changes[]? | select((.change.actions | index("no-op") | not) and (.change.actions | index("read") | not))] as $c | [ ($c | map(select(.change.actions == ["create"])) | length), ($c | map(select(.change.actions == ["update"])) | length), ($c | map(select(.change.actions == ["delete"])) | length), ($c | map(select((.change.actions | index("delete")) and (.change.actions | index("create")))) | length) ] | @tsv' "$wd/tfplan.json")"
+                IFS=$'\\t' read -r add chg del rep <<< "$stats"
               fi
               printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' "$stack" "$rc" "$add" "$chg" "$del" "$rep" > "$STATE_DIR/results/$id.tsv"
               exit 0
