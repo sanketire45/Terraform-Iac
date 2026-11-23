@@ -5,32 +5,32 @@ pipeline {
     choice(
       name: 'ENV',
       choices: ['dev', 'qa', 'stage', 'prod', '_shared'],
-      description: 'Environment folder under infra-live/L3-platform-data/<ENV>. _shared = kms / ecr / private-ca, apply it BEFORE the environments.'
+      description: 'Which environment to act on. Picks the config file pipelines/config/<ENV>-config.txt and the folder infra-live/.../<ENV>/.'
     )
     choice(
       name: 'REGION',
       choices: ['us-east-2'],
-      description: 'Region folder (state key + provider region).'
+      description: 'Which region subfolder to act on.'
     )
     string(
-      name: 'COMPONENT',
-      defaultValue: 'all',
-      description: "One stack folder (or a,b,c), or 'all' = detect from the git diff."
+      name: 'STACKS',
+      defaultValue: 'auto',
+      description: "WHICH stack folders to touch. Comma-separated list, e.g. 'kms,rds-mysql' = exactly these. 'auto' = detect from the git diff (empty on a clean build). Ignored when DEPLOY_ALL is ticked."
     )
     choice(
       name: 'ACTION',
       choices: ['plan', 'apply', 'destroy'],
-      description: 'plan = plan only; apply = plan, approval, apply, verify; destroy = destroy plan, approval, destroy in reverse order (needs COMPONENT or ALL_STACKS).'
+      description: 'WHAT to do. plan = plan only, no change. apply = plan + approval + apply + verify. destroy = reverse-order destroy (approval always required; STACKS or DEPLOY_ALL must name what to destroy).'
     )
     booleanParam(
       name: 'AUTO_APPROVE',
       defaultValue: false,
-      description: 'Skip the approval gate. Honoured for stage only; prod, _shared and every destroy always need an approver.'
+      description: 'apply only: skip the human approval step. Honoured on stage. prod, _shared and every destroy always need approval.'
     )
     booleanParam(
-      name: 'ALL_STACKS',
+      name: 'DEPLOY_ALL',
       defaultValue: false,
-      description: 'Ignore the git diff: every leaf in scope (first deploy, re-run after an outage).'
+      description: 'Override STACKS and act on EVERY stack of this ENV/REGION. Use for the very first deploy or a rebuild after an outage. When unticked, STACKS decides.'
     )
   }
 
@@ -61,8 +61,8 @@ pipeline {
           extensions: [[$class: 'CloneOption', noTags: false, shallow: false]]
         ])
         script {
-          if (!(params.COMPONENT ==~ /^[a-z0-9_,-]+$/)) {
-            error("COMPONENT '${params.COMPONENT}' is not a valid stack folder list")
+          if (!(params.STACKS ==~ /^[a-z0-9_,-]+$/)) {
+            error("STACKS '${params.STACKS}' is not a valid stack folder list")
           }
 
           def byUser = currentBuild.getBuildCauses('hudson.model.Cause$UserIdCause')
@@ -71,15 +71,15 @@ pipeline {
           env.TARGET_ENV    = env.CHANGE_ID ? 'any'  : (params.ENV ?: 'dev')
           env.TARGET_REGION = env.CHANGE_ID ? 'any'  : (params.REGION ?: 'us-east-2')
           env.TARGET_ACTION = env.CHANGE_ID ? 'plan' : (params.ACTION ?: 'plan')
-          env.ALL_STACKS    = "${params.ALL_STACKS ?: false}"
+          env.ALL_STACKS    = "${params.DEPLOY_ALL ?: false}"
 
           if (!env.CHANGE_ID && env.BRANCH_NAME == 'main' && !byUser) {
             env.TARGET_ENV    = 'dev'
             env.TARGET_ACTION = 'apply'
           }
 
-          if (env.TARGET_ACTION == 'destroy' && params.COMPONENT == 'all' && !params.ALL_STACKS) {
-            error("ACTION=destroy needs COMPONENT=<leaf names> (or tick ALL_STACKS). It never works from the git diff.")
+          if (env.TARGET_ACTION == 'destroy' && params.STACKS == 'auto' && !params.DEPLOY_ALL) {
+            error("ACTION=destroy needs STACKS=<leaf names> (or tick DEPLOY_ALL). It never works from the git diff.")
           }
 
           currentBuild.displayName = "#${env.BUILD_NUMBER} ${env.TARGET_ENV}/${env.LAYER} ${env.TARGET_ACTION}"
@@ -172,15 +172,15 @@ pipeline {
                 | sed "s|^$LIVE/||; s|/main.tf$||" || true
             }
 
-            if [ "$COMPONENT" != all ]; then
-              log "explicit COMPONENT=$COMPONENT (the git diff is ignored)"
-              for c in $(printf '%s' "$COMPONENT" | tr ',' ' '); do
+            if [ "$STACKS" != auto ]; then
+              log "explicit STACKS=$STACKS (the git diff is ignored)"
+              for c in $(printf '%s' "$STACKS" | tr ',' ' '); do
                 n0="$(wc -l < "$tmp/cand.txt" | tr -d ' ')"
                 awk -F/ -v c="$c" '$NF == c' "$tmp/scope.txt" >> "$tmp/cand.txt"
                 [ "$(wc -l < "$tmp/cand.txt" | tr -d ' ')" -gt "$n0" ] || die "component '$c' has no leaf in $layer for env=$TARGET_ENV region=$TARGET_REGION"
               done
             elif [ "$ALL_STACKS" = true ]; then
-              log "ALL_STACKS=true → every leaf in scope"
+              log "DEPLOY_ALL=true → every leaf in scope"
               cp "$tmp/scope.txt" "$tmp/cand.txt"
             else
               base="$(resolve_base)"
@@ -458,7 +458,7 @@ pipeline {
                 [ -z "$STARTED_BY" ] || [ "$APPROVER" != "$STARTED_BY" ] || die "four-eyes rule: '$APPROVER' started this $TARGET_ENV build and cannot approve it" ;;
             esac
 
-            jq -n --arg env "$TARGET_ENV" --arg region "$TARGET_REGION" --arg action "$TARGET_ACTION" --arg component "$COMPONENT" \\
+            jq -n --arg env "$TARGET_ENV" --arg region "$TARGET_REGION" --arg action "$TARGET_ACTION" --arg component "$STACKS" \\
                   --arg approver "$APPROVER" --arg started "$STARTED_BY" --arg ticket "$CHANGE_TICKET" \\
                   --arg build "${BUILD_TAG:-manual}" --arg sha "$(cat "$STATE_DIR/git_sha" 2>/dev/null || echo unknown)" \\
                   --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \\
@@ -710,7 +710,7 @@ def libSh() {
     TARGET_ENV="${TARGET_ENV:-${ENV:-any}}"
     TARGET_REGION="${TARGET_REGION:-${REGION:-any}}"
     TARGET_ACTION="${TARGET_ACTION:-${ACTION:-plan}}"
-    COMPONENT="${COMPONENT:-all}"
+    STACKS="${STACKS:-auto}"
     PLAN_PARALLEL="${PLAN_PARALLEL:-4}"
     CHANGED_FILE="$STATE_DIR/changed_stacks.txt"
     APPLY_FILE="$STATE_DIR/apply_stacks.txt"
